@@ -235,13 +235,10 @@ impl Searcher {
 
         // Two ceilings on the wall, and the second is the one that matters.
         //
-        // Three times the plan lets a single critical move think properly.
-        // Two fifths of what is left stops that from being a way to spend the
-        // clock: the first version had a wall at a third of the clock with no
-        // second ceiling, and over a forty-seven move game the drain was
-        // gradual rather than dramatic -- no single move looked wrong, the
-        // longest was 1.2 seconds, and it still ran out.
-        let hard = (base * 3).min(usable * 2 / 5);
+        // Twice the plan lets a critical move think a little longer. Two
+        // fifths of what is left stops that from becoming a way to spend the
+        // clock.
+        let hard = (base * 2).min(usable * 2 / 5);
         let soft = base.min(hard);
 
         self.soft = Duration::from_millis(soft.max(1));
@@ -302,6 +299,7 @@ impl Searcher {
         let mut best_score = 0;
 
         for depth in 1..=max_depth {
+            let iter_start = self.start.elapsed();
             let score = self.aspiration(board, depth as i32, best_score);
 
             // An aborted iteration has searched only part of the move list, so
@@ -323,8 +321,25 @@ impl Searcher {
             if limits.nodes.map_or(false, |n| self.nodes >= n) {
                 break;
             }
-            // Not enough left for another iteration to be worth starting.
-            if self.start.elapsed() >= self.soft {
+
+            // Is there room for another iteration, not is there room for the
+            // one just finished.
+            //
+            // Each depth costs roughly twice the one before, so stopping only
+            // once the plan is already spent means routinely starting an
+            // iteration that cannot fit and letting the wall end it. The spend
+            // then settles at about twice the plan, which is enough to break
+            // even against the increment: measured over a fifty-nine move game
+            // at 8+0.08, the engine used 12.69 seconds of a 12.72 second
+            // budget and flagged. Nothing looked wrong move by move -- the
+            // longest was 0.72 seconds -- because nothing was wrong move by
+            // move.
+            //
+            // Predicting the next one instead leaves the margin the increment
+            // is supposed to build.
+            let elapsed = self.start.elapsed();
+            let last = elapsed.saturating_sub(iter_start);
+            if elapsed + last * 2 >= self.soft {
                 break;
             }
         }
@@ -508,14 +523,16 @@ impl Searcher {
         if moves.is_empty() {
             return if in_check { mate_score(ply) } else { 0 };
         }
-        self.order(board, &mut moves, tt_move, ply);
+        let mut scores = self.score_moves(board, &moves, tt_move, ply);
 
         let mut best_score = -INF;
         let mut best_move = None;
         let alpha_orig = alpha;
         let mut searched_quiets: Vec<Move> = Vec::new();
 
-        for (i, mv) in moves.iter().enumerate() {
+        for i in 0..moves.len() {
+            Self::pick(&mut moves, &mut scores, i);
+            let mv = &moves[i];
             let is_quiet = !mv.is_capture() && mv.promotion.is_none();
 
             let undo = board.make_move(mv);
@@ -647,11 +664,13 @@ impl Searcher {
         if in_check && moves.is_empty() {
             return mate_score(ply);
         }
-        self.order(board, &mut moves, None, ply);
+        let mut scores = self.score_moves(board, &moves, None, ply);
 
         let mut best = if in_check { -INF } else { alpha };
 
-        for mv in &moves {
+        for i in 0..moves.len() {
+            Self::pick(&mut moves, &mut scores, i);
+            let mv = &moves[i];
             let undo = board.make_move(mv);
             self.keys.push(board.hash);
             let score = -self.quiescence(board, -beta, -alpha, ply + 1);
@@ -708,12 +727,21 @@ impl Searcher {
         }
     }
 
-    fn order(&self, board: &Board, moves: &mut [Move], tt_move: Option<Move>, ply: usize) {
+    /// Score every move once. The caller then takes the best remaining one at
+    /// a time, because most nodes cut off after two or three and sorting the
+    /// other thirty-seven is work thrown away.
+    fn score_moves(
+        &self,
+        board: &Board,
+        moves: &[Move],
+        tt_move: Option<Move>,
+        ply: usize,
+    ) -> Vec<i32> {
         let side = board.side.idx();
-        let mut scored: Vec<(i32, Move)> = moves
+        moves
             .iter()
             .map(|mv| {
-                let s = if Some(*mv) == tt_move {
+                if Some(*mv) == tt_move {
                     1_000_000
                 } else if mv.is_capture() {
                     // Most valuable victim, least valuable attacker. Crude, and
@@ -740,13 +768,21 @@ impl Searcher {
                     290_000
                 } else {
                     self.history[side][mv.from as usize][mv.to as usize]
-                };
-                (s, *mv)
+                }
             })
-            .collect();
-        scored.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-        for (i, (_, mv)) in scored.into_iter().enumerate() {
-            moves[i] = mv;
+            .collect()
+    }
+
+    /// Bring the best remaining move to `at`, keeping scores in step.
+    #[inline]
+    fn pick(moves: &mut [Move], scores: &mut [i32], at: usize) {
+        let mut best = at;
+        for j in at + 1..moves.len() {
+            if scores[j] > scores[best] {
+                best = j;
+            }
         }
+        moves.swap(at, best);
+        scores.swap(at, best);
     }
 }
