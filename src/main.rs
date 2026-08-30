@@ -18,6 +18,7 @@ mod moves;
 mod nnue;
 mod perft;
 mod search;
+mod see;
 mod tt;
 mod types;
 mod uci;

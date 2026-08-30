@@ -15,11 +15,32 @@ use crate::board::Board;
 use crate::moves::{Move, MoveFlag};
 use crate::movegen::{generate_legal, generate_legal_caps};
 use crate::nnue;
+use crate::see;
 use crate::tt::{Bound, TranspositionTable, TT_EVAL_NONE};
 use crate::types::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// How much to reduce a late quiet move by, indexed by depth and by how many
+/// moves have already been tried.
+///
+/// A table rather than an expression because the expression wanted logarithms,
+/// and the first version computed them in integers -- `ln(3)` and `ln(4)` both
+/// truncate to 1, so the reduction was very nearly a constant and the whole
+/// point of reducing later moves harder was lost.
+fn lmr_table() -> &'static [[i32; 64]; 64] {
+    static T: std::sync::OnceLock<[[i32; 64]; 64]> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let mut t = [[0i32; 64]; 64];
+        for d in 1..64usize {
+            for m in 1..64usize {
+                t[d][m] = (0.77 + (d as f64).ln() * (m as f64).ln() / 2.36) as i32;
+            }
+        }
+        t
+    })
+}
 
 pub const MAX_PLY: usize = 128;
 pub const INF: i32 = 32_000;
@@ -547,10 +568,18 @@ impl Searcher {
                 // searched shallower until one of them proves otherwise.
                 let mut r = 0;
                 if depth >= 3 && is_quiet && !in_check {
-                    r = 1 + (depth as f64).ln() as i32 * (i as f64).ln() as i32 / 3;
+                    r = lmr_table()[(depth as usize).min(63)][i.min(63)];
+                    // A position that once earned a full window is less likely
+                    // to be the throwaway this reduction assumes.
                     if tt_pv {
                         r -= 1;
                     }
+                    if !pv_node {
+                        r += 1;
+                    }
+                    // A move the history likes gets the benefit of the doubt,
+                    // one it dislikes gets less of it.
+                    r -= (scores[i] / 4096).clamp(-2, 2);
                     r = r.clamp(0, depth - 2);
                 }
                 score = -self.negamax(board, depth - 1 - r, -alpha - 1, -alpha, ply + 1, false);
@@ -670,12 +699,20 @@ impl Searcher {
 
         for i in 0..moves.len() {
             Self::pick(&mut moves, &mut scores, i);
-            let mv = &moves[i];
-            let undo = board.make_move(mv);
+            let mv = moves[i];
+
+            // A capture that loses material cannot raise the floor we are
+            // already standing on, and following it is how quiescence chases
+            // every recapture to the horizon instead of settling.
+            if !in_check && !see::see_ge(&self.atk, board, &mv, 0) {
+                continue;
+            }
+
+            let undo = board.make_move(&mv);
             self.keys.push(board.hash);
             let score = -self.quiescence(board, -beta, -alpha, ply + 1);
             self.keys.pop();
-            board.unmake_move(mv, &undo);
+            board.unmake_move(&mv, &undo);
 
             if self.stopped {
                 return 0;
@@ -744,9 +781,6 @@ impl Searcher {
                 if Some(*mv) == tt_move {
                     1_000_000
                 } else if mv.is_capture() {
-                    // Most valuable victim, least valuable attacker. Crude, and
-                    // the first thing worth replacing with something that knows
-                    // whether the capture actually wins material.
                     let victim = if mv.flag == MoveFlag::EnPassant {
                         PieceType::Pawn.value()
                     } else {
@@ -759,13 +793,23 @@ impl Searcher {
                         .piece_at(mv.from)
                         .map(|(pt, _)| pt.value())
                         .unwrap_or(0);
-                    500_000 + victim * 16 - attacker
+                    let mvv = victim * 16 - attacker;
+                    // A capture that loses material is not a good move that
+                    // happens to be violent, and putting it ahead of the quiet
+                    // moves on the strength of what it takes is how a search
+                    // spends its first three tries on refuted sacrifices.
+                    // Below everything, then, but still ahead of nothing.
+                    if see::see_ge(&self.atk, board, mv, 0) {
+                        600_000 + mvv
+                    } else {
+                        -600_000 + mvv
+                    }
                 } else if mv.promotion == Some(PieceType::Queen) {
-                    400_000
+                    500_000
                 } else if Some(*mv) == self.killers[ply][0] {
-                    300_000
+                    400_000
                 } else if Some(*mv) == self.killers[ply][1] {
-                    290_000
+                    390_000
                 } else {
                     self.history[side][mv.from as usize][mv.to as usize]
                 }
