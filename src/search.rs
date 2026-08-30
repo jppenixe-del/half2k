@@ -460,9 +460,12 @@ impl Searcher {
             let moves = (plies + 1) / 2;
             format!("mate {}", if score > 0 { moves } else { -moves })
         } else {
-            // Reported in the units the network was trained in, which is what
-            // makes the win/draw/loss figures below mean anything.
-            format!("cp {}", score)
+            // Two internal units to the centipawn, from the training
+            // quantisation. The win/draw/loss figures below are NOT converted:
+            // that model was fitted against the internal units and its offset
+            // and scaling are in them, so handing it centipawns would quietly
+            // halve every probability it reports.
+            format!("cp {}", score / 2)
         };
         let (w, d, l) = nnue::wdl(score);
         let mut pv = String::new();
