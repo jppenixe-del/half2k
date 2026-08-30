@@ -42,6 +42,33 @@ fn lmr_table() -> &'static [[i32; 64]; 64] {
     })
 }
 
+/// Correction history: how wrong the static evaluation usually is here.
+///
+/// The pruning margins are fixed numbers compared against the static score.
+/// When that score is *systematically* wrong for a family of positions -- and
+/// it is, because the network cannot see what only the search finds -- those
+/// margins bite in the wrong place, the same way every time. This keeps a
+/// running average of what the search ended up saying minus what the static
+/// score said, indexed by pawn structure, and feeds it back next time that
+/// structure appears.
+///
+/// The key is the two pawn bitboards mixed together rather than an incremental
+/// key. Derived from the state, it cannot drift out of sync with it, and a
+/// heuristic table tolerates collisions by construction.
+const CORR_SIZE: usize = 16384;
+const CORR_GRAIN: i32 = 256;
+const CORR_MAX: i32 = 32 * CORR_GRAIN;
+
+#[inline]
+fn corr_index(board: &Board) -> usize {
+    let w = board.pieces[Color::White.idx()][PieceType::Pawn.idx()];
+    let b = board.pieces[Color::Black.idx()][PieceType::Pawn.idx()];
+    let mut z = w.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(b);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    ((z ^ (z >> 31)) as usize) & (CORR_SIZE - 1)
+}
+
 pub const MAX_PLY: usize = 128;
 pub const INF: i32 = 32_000;
 pub const MATE: i32 = 31_000;
@@ -82,6 +109,14 @@ pub struct Searcher {
 
     killers: [[Option<Move>; 2]; MAX_PLY],
     history: [[[i32; 64]; 64]; 2],
+    /// `[side][pawn structure]`.
+    corr: Vec<[i32; CORR_SIZE]>,
+    /// What was played at each ply, as (piece, destination). Continuation
+    /// history is indexed by this: a move is good or bad largely in reply to
+    /// something, and a table that ignores what came before cannot say which.
+    played: [Option<(usize, usize)>; MAX_PLY],
+    /// `[prev piece * 64 + prev to][piece][to]`.
+    conthist: Vec<[[i32; 64]; 6]>,
     /// Zobrist keys along the path plus the game so far, for repetition.
     keys: Vec<u64>,
     /// How many of `keys` are game history rather than search path.
@@ -179,6 +214,9 @@ impl Searcher {
             stopped: false,
             killers: [[None; 2]; MAX_PLY],
             history: [[[0; 64]; 64]; 2],
+            corr: vec![[0; CORR_SIZE]; 2],
+            played: [None; MAX_PLY],
+            conthist: vec![[[0; 64]; 6]; 6 * 64],
             keys: Vec::with_capacity(1024),
             root_keys: 0,
             pv: [[None; MAX_PLY]; MAX_PLY],
@@ -196,6 +234,40 @@ impl Searcher {
         self.tt.clear();
         self.killers = [[None; 2]; MAX_PLY];
         self.history = [[[0; 64]; 64]; 2];
+        self.corr = vec![[0; CORR_SIZE]; 2];
+        self.conthist = vec![[[0; 64]; 6]; 6 * 64];
+    }
+
+    /// The static score, adjusted by what the search has been saying about
+    /// positions with this pawn structure.
+    #[inline]
+    fn corrected(&self, board: &Board, raw: i32) -> i32 {
+        let c = self.corr[board.side.idx()][corr_index(board)] / CORR_GRAIN;
+        (raw + c).clamp(-MATE_IN_MAX + 1, MATE_IN_MAX - 1)
+    }
+
+    /// Learn from the difference, weighted by how deep the search that found
+    /// it went.
+    #[inline]
+    fn learn_correction(&mut self, board: &Board, diff: i32, depth: i32) {
+        let e = &mut self.corr[board.side.idx()][corr_index(board)];
+        let target = (diff * CORR_GRAIN).clamp(-CORR_MAX, CORR_MAX);
+        let w = (depth + 1).min(16);
+        *e = ((*e * (256 - w) + target * w) / 256).clamp(-CORR_MAX, CORR_MAX);
+    }
+
+    /// The continuation tables in reach at this ply: one ply back and two.
+    #[inline]
+    fn cont_slots(&self, ply: usize) -> [Option<usize>; 2] {
+        let mut out = [None; 2];
+        for (k, back) in [1usize, 2].iter().enumerate() {
+            if ply >= *back {
+                if let Some((pc, to)) = self.played[ply - back] {
+                    out[k] = Some(pc * 64 + to);
+                }
+            }
+        }
+        out
     }
 
     /// Decide how long this move may take.
@@ -507,6 +579,14 @@ impl Searcher {
                 }
             }
         };
+        // The table keeps the raw number, the search uses the corrected one.
+        // Deliberately different: the table is shared, and whoever reads it
+        // later applies their own correction.
+        let static_eval = if in_check {
+            static_eval
+        } else {
+            self.corrected(board, static_eval)
+        };
 
         if !pv_node && !in_check {
             // Reverse futility: so far ahead that giving away the margin still
@@ -599,6 +679,9 @@ impl Searcher {
                 }
             }
 
+            self.played[ply] = board
+                .piece_at(mv.from)
+                .map(|(pt, _)| (pt.idx(), mv.to as usize));
             let undo = board.make_move(&mv);
             self.keys.push(board.hash);
 
@@ -674,6 +757,23 @@ impl Searcher {
             if is_quiet {
                 searched_quiets.push(mv);
             }
+        }
+
+        // Learn the correction from what the search ended up saying, but only
+        // where it contradicts the static score in a direction worth trusting:
+        // below it and below beta, so there is an upper bound proving the
+        // static score was optimistic, or above it with a move to show why.
+        // Anywhere else the number is the product of a cutoff, not a reading of
+        // the position. Captures are excluded: there the jump comes from
+        // material rather than from misreading, and it would teach the table
+        // the wrong thing.
+        if !in_check
+            && best_score.abs() < MATE_IN_MAX
+            && !best_move.map_or(false, |m| m.is_capture())
+            && ((best_score < static_eval && best_score < beta)
+                || (best_score > static_eval && best_move.is_some()))
+        {
+            self.learn_correction(board, best_score - static_eval, depth);
         }
 
         let bound = if best_score >= beta {
@@ -842,13 +942,28 @@ impl Searcher {
         }
         let side = board.side.idx();
         let bonus = (depth * depth).min(1200);
-        let h = &mut self.history[side][mv.from as usize][mv.to as usize];
+        let slots = self.cont_slots(ply);
+
         // Saturating: without the pull towards zero a few deep cutoffs pin an
         // entry at the ceiling and it stops carrying information.
+        let h = &mut self.history[side][mv.from as usize][mv.to as usize];
         *h += bonus - *h * bonus / 8192;
+        if let Some(pc) = board.piece_at(mv.from).map(|(pt, _)| pt.idx()) {
+            for slot in slots.into_iter().flatten() {
+                let c = &mut self.conthist[slot][pc][mv.to as usize];
+                *c += bonus - *c * bonus / 8192;
+            }
+        }
+
         for q in searched {
             let h = &mut self.history[side][q.from as usize][q.to as usize];
             *h += -bonus - *h * bonus / 8192;
+            if let Some(pc) = board.piece_at(q.from).map(|(pt, _)| pt.idx()) {
+                for slot in slots.into_iter().flatten() {
+                    let c = &mut self.conthist[slot][pc][q.to as usize];
+                    *c += -bonus - *c * bonus / 8192;
+                }
+            }
         }
     }
 
@@ -863,6 +978,10 @@ impl Searcher {
         ply: usize,
     ) -> Vec<i32> {
         let side = board.side.idx();
+        // Hoisted: the continuation slots depend on the ply, not on the move,
+        // and looking them up per move turned a couple of array reads into a
+        // couple per move in the hottest loop there is.
+        let slots = self.cont_slots(ply);
         moves
             .iter()
             .map(|mv| {
@@ -899,7 +1018,13 @@ impl Searcher {
                 } else if Some(*mv) == self.killers[ply][1] {
                     390_000
                 } else {
-                    self.history[side][mv.from as usize][mv.to as usize]
+                    let mut h = self.history[side][mv.from as usize][mv.to as usize];
+                    if let Some(pc) = board.piece_at(mv.from).map(|(pt, _)| pt.idx()) {
+                        for slot in slots.into_iter().flatten() {
+                            h += self.conthist[slot][pc][mv.to as usize];
+                        }
+                    }
+                    h
                 }
             })
             .collect()
