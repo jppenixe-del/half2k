@@ -246,7 +246,7 @@ impl Accumulator {
             if h.bucket == bucket && h.mirror == mirror {
                 continue;
             }
-            *h = rebuild_half(net, pieces, kings[p.idx()], p);
+            with_cache(|c| c.refresh(net, pieces, p, bucket, mirror, h));
             done += 1;
         }
         done
@@ -404,6 +404,142 @@ mod simd {
         s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b10_11_00_01));
         _mm_cvtsi128_si32(s)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Refresh cache
+//
+// The bucket here is the folded king square itself, so every king move
+// invalidates one whole perspective, and king moves are around a quarter of all
+// moves. Rebuilding from nothing means adding all thirty-two pieces back, and
+// each of those reads a kilobyte from a twenty-five megabyte table, so the cost
+// is memory rather than arithmetic and no amount of vectorising touches it.
+//
+// The cache turns the rebuild into a difference. Keep one accumulator per
+// (perspective, bucket, mirror) alongside the piece placement that produced it;
+// on a refresh, start from that and apply only the pieces that have moved
+// since. A piece that stayed put contributes the same feature and needs no work
+// at all, which is the whole point.
+//
+// The invariant that makes it safe: an entry always holds an accumulator that
+// exactly matches its stored placement. Update both together or neither, and a
+// stale entry becomes impossible rather than merely unlikely -- a quietly wrong
+// accumulator shows up as an evaluation that is subtly off in rare positions,
+// which is the hardest kind of bug to trace back to here.
+//
+// Keyed by the mirror as well as the bucket, and it has to be: a king on d1 and
+// a king on e1 fold to the same bucket while needing opposite mirrors. Keyed by
+// bucket alone, an entry built for one is handed to the other and every square
+// comes back flipped.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct CacheEntry {
+    values: [i16; HIDDEN],
+    psqt: [i32; OUT_BUCKETS],
+    /// The placement `values` was built from.
+    pieces: [[Bitboard; 6]; 2],
+    used: bool,
+}
+
+pub struct RefreshCache {
+    entries: Vec<CacheEntry>,
+}
+
+impl RefreshCache {
+    pub fn new() -> Self {
+        RefreshCache {
+            entries: vec![
+                CacheEntry {
+                    values: [0; HIDDEN],
+                    psqt: [0; OUT_BUCKETS],
+                    pieces: [[0; 6]; 2],
+                    used: false,
+                };
+                2 * 2 * INPUT_BUCKETS
+            ],
+        }
+    }
+
+    #[inline]
+    fn index(perspective: Color, bucket: usize, mirror: bool) -> usize {
+        (perspective.idx() * 2 + mirror as usize) * INPUT_BUCKETS + bucket
+    }
+
+    /// Bring one perspective up to date, starting from whatever this bucket was
+    /// last seen holding. Returns how many piece updates it took, so what the
+    /// cache saves can be measured rather than assumed.
+    pub fn refresh(
+        &mut self,
+        net: &Network,
+        pieces: &[[Bitboard; 6]; 2],
+        perspective: Color,
+        bucket: usize,
+        mirror: bool,
+        dst: &mut Half,
+    ) -> usize {
+        let e = &mut self.entries[Self::index(perspective, bucket, mirror)];
+        if !e.used {
+            // Nothing here yet. An empty accumulator for this network is all
+            // zeros -- there is no hidden layer bias to seed it from -- so the
+            // entry starts from an empty board and the first refresh pays the
+            // full price. Every later one starts from this.
+            e.values = [0; HIDDEN];
+            e.psqt = [0; OUT_BUCKETS];
+            e.pieces = [[0; 6]; 2];
+            e.used = true;
+        }
+
+        let mut touched = 0usize;
+        for c in [Color::White, Color::Black] {
+            for pt in ALL_PIECES {
+                let now = pieces[c.idx()][pt.idx()];
+                let before = e.pieces[c.idx()][pt.idx()];
+                let mut gone = before & !now;
+                while gone != 0 {
+                    let sq = gone.trailing_zeros() as Square;
+                    gone &= gone - 1;
+                    let f = feature(perspective, bucket, mirror, c, pt, sq);
+                    apply(&mut e.values, &net.l0w[f], false);
+                    for b in 0..OUT_BUCKETS {
+                        e.psqt[b] -= net.psqt[f][b] as i32;
+                    }
+                    touched += 1;
+                }
+                let mut arrived = now & !before;
+                while arrived != 0 {
+                    let sq = arrived.trailing_zeros() as Square;
+                    arrived &= arrived - 1;
+                    let f = feature(perspective, bucket, mirror, c, pt, sq);
+                    apply(&mut e.values, &net.l0w[f], true);
+                    for b in 0..OUT_BUCKETS {
+                        e.psqt[b] += net.psqt[f][b] as i32;
+                    }
+                    touched += 1;
+                }
+                // Placement and values move together, always.
+                e.pieces[c.idx()][pt.idx()] = now;
+            }
+        }
+
+        dst.values.copy_from_slice(&e.values);
+        dst.psqt = e.psqt;
+        dst.bucket = bucket;
+        dst.mirror = mirror;
+        touched
+    }
+}
+
+thread_local! {
+    /// Per thread rather than shared: two threads on one cache would each
+    /// invalidate the other on every king move, which costs more than having no
+    /// cache at all.
+    static CACHE: std::cell::RefCell<RefreshCache> =
+        std::cell::RefCell::new(RefreshCache::new());
+}
+
+pub fn with_cache<R>(f: impl FnOnce(&mut RefreshCache) -> R) -> R {
+    CACHE.with(|c| f(&mut c.borrow_mut()))
 }
 
 /// Whether the vector path may be used. Decided once.

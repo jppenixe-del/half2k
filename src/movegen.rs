@@ -277,9 +277,25 @@ fn gera_legal<const APENAS_CAPTURAS: bool>(board: &mut Board, atk: &Attacks) -> 
             }
             continue;
         }
+        // The accumulator is lifted out for the duration.
+        //
+        // This make/unmake exists only to ask whether the move leaves our own
+        // king in check. It was free when a board was bitboards and a mailbox;
+        // it is not free now that moving a piece also updates the network, and
+        // a king move on top of that throws away a whole perspective and
+        // rebuilds it -- twice, once each way, for a question that has nothing
+        // to do with evaluation.
+        //
+        // Taking the accumulator out is exactly symmetric by construction:
+        // with nothing there, `add_piece`, `remove_piece` and the refresh all
+        // do nothing, so what goes back is what came out. Measured on a middle
+        // game position, this alone took the search from 131k to the figure in
+        // the commit message.
+        let saved = board.acc.take();
         let undo = board.make_move(&mv);
         let illegal = board.in_check(us, atk);
         board.unmake_move(&mv, &undo);
+        board.acc = saved;
         if !illegal {
             legal.push(mv);
         }

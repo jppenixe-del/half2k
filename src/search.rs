@@ -246,10 +246,15 @@ impl Searcher {
         if self.stopped {
             return true;
         }
-        // Checking the clock is a syscall; doing it every node costs more than
-        // it saves. Every 2048 nodes is fine grained enough that the overshoot
-        // is far below the overhead already held back.
-        if self.nodes & 2047 == 0
+        // Checking the clock is a syscall, so it is not done every node. But
+        // the interval is a floor on how long the search can run without
+        // noticing, and it has to be small enough to fit inside the smallest
+        // allocation we will ever make. At 2048 it was not: a first iteration
+        // in a middle game position is under two thousand nodes, so in real
+        // time trouble the whole of it ran without the clock being read once,
+        // and the engine sailed past a forty millisecond wall by taking a
+        // hundred. At 512 the blind spot is a couple of milliseconds.
+        if self.nodes & 511 == 0
             && (self.start.elapsed() >= self.hard || self.stop.load(Ordering::Relaxed))
         {
             self.stopped = true;
