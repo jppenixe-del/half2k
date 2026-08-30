@@ -15,6 +15,7 @@ mod board;
 mod magic;
 mod movegen;
 mod moves;
+mod nnue;
 mod perft;
 mod tt;
 mod types;
@@ -22,6 +23,7 @@ mod zobrist;
 
 use attacks::Attacks;
 use board::Board;
+use types::Color;
 
 /// Positions whose node counts are published and agreed on, so a disagreement
 /// is ours and not a matter of interpretation. Between them they exercise
@@ -54,7 +56,6 @@ const PERFT_SUITE: &[(&str, &[u64])] = &[
     ),
 ];
 
-/// Runs the suite and reports. Returns the number of disagreements.
 fn perft_suite(max_nodes: u64) -> u32 {
     let atk = Attacks::new();
     let mut bad = 0u32;
@@ -97,12 +98,42 @@ fn perft_suite(max_nodes: u64) -> u32 {
     bad
 }
 
+/// Score one position, White's point of view.
+///
+/// White's rather than the side to move's because that is the frame the
+/// reference prints in, and a comparison that has to flip a sign on the way is
+/// a comparison with somewhere for a sign error to hide.
+///
+/// Reads the board's own accumulator rather than building one here, so this
+/// exercises the path the search will use rather than a private shortcut.
+fn eval_white(net: &nnue::Network, board: &Board) -> i32 {
+    let acc = board.acc.as_ref().expect("no accumulator: install a network first");
+    let stm_score = acc.eval(net, board.side, board.occ_all.count_ones());
+    if board.side == Color::White {
+        stm_score
+    } else {
+        -stm_score
+    }
+}
+
+/// Load a network and install it, or die saying why.
+fn install_net(path: &str) -> &'static nnue::Network {
+    match nnue::load(path) {
+        Ok(n) => {
+            nnue::install(n);
+            nnue::net().unwrap()
+        }
+        Err(e) => {
+            eprintln!("network: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
         Some("perft") => {
-            // Everything up to and including the six-figure depths by default;
-            // pass a bigger budget to run the long ones.
             let budget: u64 = args
                 .get(2)
                 .and_then(|s| s.parse().ok())
@@ -114,6 +145,55 @@ fn main() {
                 println!("\n{} disagreements", bad);
                 std::process::exit(1);
             }
+        }
+        // `evalfens <network> <file of FENs>` -- one score per line, for
+        // diffing against the oracle.
+        Some("evalfens") => {
+            let net = install_net(&args[2]);
+            let text = std::fs::read_to_string(&args[3]).expect("fen file");
+            for line in text.lines() {
+                let fen = line.trim();
+                if fen.is_empty() {
+                    continue;
+                }
+                let board = Board::from_fen(fen);
+                println!("{}", eval_white(net, &board));
+            }
+        }
+        // `verify <network> [depth]` -- walk the same positions perft does, and
+        // at every node compare the incrementally updated accumulator against
+        // one rebuilt from scratch. Depth 4 already covers a few million nodes
+        // and every kind of move that touches more than one square.
+        Some("verify") => {
+            install_net(&args[2]);
+            let depth: u32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(4);
+            let atk = Attacks::new();
+            let mut wrong_total = 0u64;
+            for (fen, _) in PERFT_SUITE {
+                let mut board = Board::from_fen(fen);
+                let t = std::time::Instant::now();
+                let (nodes, wrong) = perft::verify_accumulator(&mut board, depth, &atk);
+                wrong_total += wrong;
+                println!(
+                    "  {:>10} nodes  {:>6} wrong  {:.1}s  {}",
+                    nodes,
+                    wrong,
+                    t.elapsed().as_secs_f64(),
+                    fen
+                );
+            }
+            if wrong_total == 0 {
+                println!("\nincremental matches a full rebuild everywhere");
+            } else {
+                println!("\n{} mismatches", wrong_total);
+                std::process::exit(1);
+            }
+        }
+        // `wdl <score>` -- the training win-rate model, for eyeballing.
+        Some("wdl") => {
+            let sc: i32 = args[2].parse().expect("score");
+            let (w, d, l) = nnue::wdl(sc);
+            println!("{} -> w {} d {} l {}", sc, w, d, l);
         }
         _ => println!("half2k 0.1.0"),
     }

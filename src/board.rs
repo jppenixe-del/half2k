@@ -14,6 +14,15 @@ pub struct Board {
     pub occ_color: [Bitboard; 2],
     pub occ_all: Bitboard,
     pub side: Color,
+    /// The network accumulator, carried with the position.
+    ///
+    /// Here rather than in the searcher because every path that changes a piece
+    /// already goes through `add_piece` and `remove_piece`. Anywhere else would
+    /// mean finding and patching castling, en passant and promotion separately,
+    /// and one missed case is an evaluation that is quietly wrong only in rare
+    /// positions. `None` until a network is installed, so nothing pays for it
+    /// before there is one.
+    pub acc: Option<Box<crate::nnue::Accumulator>>,
     pub castling: u8,
     pub ep_square: Square,
     pub halfmove: u32,
@@ -118,6 +127,7 @@ impl Board {
             pieces,
             occ_color: [0, 0],
             occ_all: 0,
+            acc: None,
             side,
             castling,
             ep_square,
@@ -128,6 +138,12 @@ impl Board {
         };
         b.hash = crate::zobrist::tabelas().hash_completo(&b);
         b.recompute_occ();
+        // Built once here from the finished position. Every later change goes
+        // through add_piece/remove_piece, one piece at a time.
+        if let Some(net) = crate::nnue::net() {
+            let kings = [b.king_sq(Color::White), b.king_sq(Color::Black)];
+            b.acc = Some(Box::new(crate::nnue::Accumulator::fresh(net, &b.pieces, kings)));
+        }
         b
     }
 
@@ -259,13 +275,12 @@ impl Board {
         self.occ_all &= !bb(s);
         self.mailbox[s as usize] = None;
         self.hash ^= crate::zobrist::tabelas().piece_sq[c.idx()][pt.idx()][s as usize];
-        // SEAM: the network accumulator is subtracted here.
-        //
         // This and `add_piece` are the only two places a piece ever appears on
         // or leaves a square -- castling, en passant and promotion all route
-        // through them. Hooking the accumulator anywhere else means finding and
-        // patching those three separately, and one missed case is an evaluation
-        // that is silently wrong only in rare positions.
+        // through them.
+        if let (Some(a), Some(net)) = (self.acc.as_mut(), crate::nnue::net()) {
+            a.update(net, c, pt, s, false);
+        }
     }
     fn add_piece(&mut self, pt: PieceType, c: Color, s: Square) {
         self.pieces[c.idx()][pt.idx()] |= bb(s);
@@ -273,7 +288,9 @@ impl Board {
         self.occ_all |= bb(s);
         self.mailbox[s as usize] = Some((pt, c));
         self.hash ^= crate::zobrist::tabelas().piece_sq[c.idx()][pt.idx()][s as usize];
-        // SEAM: the network accumulator is added to here. See `remove_piece`.
+        if let (Some(a), Some(net)) = (self.acc.as_mut(), crate::nnue::net()) {
+            a.update(net, c, pt, s, true);
+        }
     }
 
     /// Aplica um lance PSEUDO-LEGAL (a legalidade -- nao ficar em xeque --
@@ -408,7 +425,21 @@ impl Board {
     /// the call site already here means the network cannot arrive and forget
     /// half of it.
     #[inline]
-    fn refresh_perspectives(&mut self) {}
+    fn refresh_perspectives(&mut self) {
+        let net = match crate::nnue::net() {
+            Some(n) => n,
+            None => return,
+        };
+        // Everything the refresh needs is read BEFORE the accumulator is
+        // borrowed, because it lives inside this same struct. Reading the board
+        // through a copy taken around a mutable borrow is how an accumulator
+        // ends up describing a position that no longer exists.
+        let pieces = self.pieces;
+        let kings = [self.king_sq(Color::White), self.king_sq(Color::Black)];
+        if let Some(a) = self.acc.as_mut() {
+            a.refresh(net, &pieces, kings);
+        }
+    }
 
     /// Passa a vez ao adversario sem mover peca (para null-move pruning).
     /// So' altera `side` e limpa `ep_square`; tudo o resto fica intacto.
