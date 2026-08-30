@@ -17,8 +17,10 @@ mod movegen;
 mod moves;
 mod nnue;
 mod perft;
+mod search;
 mod tt;
 mod types;
+mod uci;
 mod zobrist;
 
 use attacks::Attacks;
@@ -195,6 +197,6 @@ fn main() {
             let (w, d, l) = nnue::wdl(sc);
             println!("{} -> w {} d {} l {}", sc, w, d, l);
         }
-        _ => println!("half2k 0.1.0"),
+        _ => uci::main_loop(),
     }
 }
