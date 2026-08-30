@@ -124,6 +124,11 @@ pub struct Searcher {
 
     pv: [[Option<Move>; MAX_PLY]; MAX_PLY],
     pv_len: [usize; MAX_PLY],
+    /// The static score at each ply, so a node can ask whether things have
+    /// been getting better for the side to move. A position that is improving
+    /// deserves a tighter margin than one that is falling apart, because the
+    /// reason to prune is confidence and there is less of it on the way down.
+    eval_stack: [i32; MAX_PLY],
     /// Which plies got there by passing. Two passes in a row prove nothing:
     /// the side to move has effectively been given a free tempo twice, and the
     /// position being searched is not one that can occur.
@@ -221,6 +226,7 @@ impl Searcher {
             root_keys: 0,
             pv: [[None; MAX_PLY]; MAX_PLY],
             pv_len: [0; MAX_PLY],
+            eval_stack: [0; MAX_PLY],
             null_at: [false; MAX_PLY],
         }
     }
@@ -588,11 +594,17 @@ impl Searcher {
             self.corrected(board, static_eval)
         };
 
+        self.eval_stack[ply] = static_eval;
+        let improving = !in_check && ply >= 2 && static_eval > self.eval_stack[ply - 2];
+
         if !pv_node && !in_check {
             // Reverse futility: so far ahead that giving away the margin still
             // beats beta, and the opponent has no way to take it all back in
-            // the remaining depth.
-            if depth < 7 && static_eval - 80 * depth >= beta && static_eval.abs() < MATE_IN_MAX {
+            // the remaining depth. A ply that is improving can afford a
+            // narrower margin, since the trend is evidence in the same
+            // direction as the score.
+            let margin = 80 * depth - 25 * improving as i32;
+            if depth < 7 && static_eval - margin >= beta && static_eval.abs() < MATE_IN_MAX {
                 return static_eval;
             }
 
@@ -662,7 +674,12 @@ impl Searcher {
                     // Late move pruning: past a certain count at low depth,
                     // the ordering has been wrong often enough that the rest
                     // are not worth the nodes.
-                    if depth <= 6 && i >= (3 + depth * depth) as usize {
+                    let count = if improving {
+                        3 + depth * depth
+                    } else {
+                        (3 + depth * depth) / 2
+                    };
+                    if depth <= 6 && i >= count as usize {
                         break;
                     }
 
@@ -683,6 +700,10 @@ impl Searcher {
                 .piece_at(mv.from)
                 .map(|(pt, _)| (pt.idx(), mv.to as usize));
             let undo = board.make_move(&mv);
+            // Ask for the child's entry now. The probe happens a function call
+            // and a check detection later, which is enough to cover part of the
+            // trip to memory -- and that trip was a fifth of the whole search.
+            self.tt.prefetch(board.hash);
             self.keys.push(board.hash);
 
             let mut score;
@@ -879,6 +900,7 @@ impl Searcher {
             }
 
             let undo = board.make_move(&mv);
+            self.tt.prefetch(board.hash);
             self.keys.push(board.hash);
             let score = -self.quiescence(board, -beta, -alpha, ply + 1);
             self.keys.pop();

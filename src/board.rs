@@ -402,7 +402,11 @@ impl Board {
         if self.ep_square != NO_SQUARE {
             self.hash ^= z.ep_file[file_of(self.ep_square) as usize];
         }
-        self.refresh_perspectives();
+        // Only a king move can invalidate a perspective wholesale, so only a
+        // king move needs to ask. Everything else was paying for the question.
+        if moving_pt == PieceType::King {
+            self.refresh_perspectives();
+        }
         undo
     }
 
@@ -512,8 +516,12 @@ impl Board {
         self.hash = undo.hash;
         // Mirrors the end of `make_move` -- see `refresh_perspectives` for why
         // leaving this out is a bug that only shows up as a quietly wrong
-        // evaluation.
-        self.refresh_perspectives();
+        // evaluation. `moving_pt` is what was on `from` before the move, so a
+        // promotion reports a pawn and castling reports the king, which is
+        // exactly right in both cases.
+        if moving_pt == PieceType::King {
+            self.refresh_perspectives();
+        }
     }
 
     pub fn to_fen(&self) -> String {
