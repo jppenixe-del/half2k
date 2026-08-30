@@ -516,6 +516,17 @@ impl Searcher {
                 return static_eval;
             }
 
+            // Razoring: so far behind that even the quiescence search is
+            // unlikely to find enough, so ask it directly instead of spending
+            // a full width on the answer. If it turns out to be wrong the
+            // score comes back above alpha and the node is searched properly.
+            if depth <= 3 && static_eval + 300 * depth < alpha {
+                let q = self.quiescence(board, alpha, alpha + 1, ply);
+                if q < alpha {
+                    return q;
+                }
+            }
+
             // Null move: hand the opponent a free move and see whether the
             // position still holds. Not with only pawns left, where passing is
             // often the best move there is and the conclusion would be wrong.
@@ -540,6 +551,13 @@ impl Searcher {
             }
         }
 
+        // Nothing in the table for a node this deep means no move worth
+        // trying first, and searching at full depth to discover one costs more
+        // than finding it a ply shallower and coming back.
+        if depth >= 4 && tt_move.is_none() {
+            depth -= 1;
+        }
+
         let mut moves = generate_legal(board, &self.atk);
         if moves.is_empty() {
             return if in_check { mate_score(ply) } else { 0 };
@@ -553,10 +571,35 @@ impl Searcher {
 
         for i in 0..moves.len() {
             Self::pick(&mut moves, &mut scores, i);
-            let mv = &moves[i];
+            let mv = moves[i];
             let is_quiet = !mv.is_capture() && mv.promotion.is_none();
 
-            let undo = board.make_move(mv);
+            // Everything here needs a score already in hand: without one, the
+            // node has nothing to compare a margin against and skipping moves
+            // risks reporting a mate that is not there.
+            if !root && !pv_node && !in_check && best_score > -MATE_IN_MAX {
+                if is_quiet {
+                    // Late move pruning: past a certain count at low depth,
+                    // the ordering has been wrong often enough that the rest
+                    // are not worth the nodes.
+                    if depth <= 6 && i >= (3 + depth * depth) as usize {
+                        break;
+                    }
+
+                    // Futility: even handed the margin, this move does not
+                    // reach alpha, and a quiet move does not change the
+                    // material to make up the difference.
+                    if depth <= 6 && static_eval + 120 + 130 * depth <= alpha {
+                        break;
+                    }
+                } else if depth <= 8 && !see::see_ge(&self.atk, board, &mv, -90 * depth) {
+                    // A capture that loses more than the depth could plausibly
+                    // win back.
+                    continue;
+                }
+            }
+
+            let undo = board.make_move(&mv);
             self.keys.push(board.hash);
 
             let mut score;
@@ -592,7 +635,7 @@ impl Searcher {
             }
 
             self.keys.pop();
-            board.unmake_move(mv, &undo);
+            board.unmake_move(&mv, &undo);
 
             if self.stopped {
                 return 0;
@@ -613,15 +656,15 @@ impl Searcher {
 
             if score > best_score {
                 best_score = score;
-                best_move = Some(*mv);
+                best_move = Some(mv);
 
                 if score > alpha {
                     alpha = score;
-                    self.update_pv(ply, *mv);
+                    self.update_pv(ply, mv);
 
                     if alpha >= beta {
                         if is_quiet {
-                            self.on_beta_cutoff(board, *mv, ply, depth, &searched_quiets);
+                            self.on_beta_cutoff(board, mv, ply, depth, &searched_quiets);
                         }
                         break;
                     }
@@ -629,7 +672,7 @@ impl Searcher {
             }
 
             if is_quiet {
-                searched_quiets.push(*mv);
+                searched_quiets.push(mv);
             }
         }
 
@@ -671,17 +714,43 @@ impl Searcher {
         }
 
         let in_check = board.in_check(board.side, &self.atk);
+        let alpha_orig = alpha;
+
+        // The table is worth reading here too. Quiescence is most of the tree,
+        // the same capture sequences transpose constantly, and every hit that
+        // returns saves not just a node but the whole tail behind it.
+        let entry = self.tt.probe(board.hash);
+        let mut tt_move = None;
+        if let Some(e) = entry {
+            tt_move = e.best;
+            if e.has_bound() {
+                let sc = score_from_tt(e.score, ply);
+                let usable = match e.bound {
+                    Bound::Exact => true,
+                    Bound::Lower => sc >= beta,
+                    Bound::Upper => sc <= alpha,
+                    Bound::NoBound => false,
+                };
+                if usable {
+                    return sc;
+                }
+            }
+        }
 
         // Standing pat: the side to move is not obliged to capture, so the
         // static score is a floor. Not while in check, where every move is
         // forced and there is nothing to stand on.
+        let mut static_eval = TT_EVAL_NONE as i32;
         if !in_check {
-            let stand = evaluate(board);
-            if stand >= beta {
-                return stand;
+            static_eval = match entry {
+                Some(e) if e.static_eval != TT_EVAL_NONE => e.static_eval as i32,
+                _ => evaluate(board),
+            };
+            if static_eval >= beta {
+                return static_eval;
             }
-            if stand > alpha {
-                alpha = stand;
+            if static_eval > alpha {
+                alpha = static_eval;
             }
         }
 
@@ -693,9 +762,10 @@ impl Searcher {
         if in_check && moves.is_empty() {
             return mate_score(ply);
         }
-        let mut scores = self.score_moves(board, &moves, None, ply);
+        let mut scores = self.score_moves(board, &moves, tt_move, ply);
 
-        let mut best = if in_check { -INF } else { alpha };
+        let mut best = if in_check { -INF } else { static_eval };
+        let mut best_move = None;
 
         for i in 0..moves.len() {
             Self::pick(&mut moves, &mut scores, i);
@@ -721,12 +791,30 @@ impl Searcher {
                 best = score;
                 if score > alpha {
                     alpha = score;
+                    best_move = Some(mv);
                     if alpha >= beta {
                         break;
                     }
                 }
             }
         }
+
+        let bound = if best >= beta {
+            Bound::Lower
+        } else if best > alpha_orig {
+            Bound::Exact
+        } else {
+            Bound::Upper
+        };
+        self.tt.store(
+            board.hash,
+            0,
+            score_to_tt(best, ply),
+            bound,
+            best_move,
+            false,
+            if in_check { TT_EVAL_NONE } else { static_eval as i16 },
+        );
 
         best
     }
