@@ -129,6 +129,9 @@ pub struct Searcher {
     /// deserves a tighter margin than one that is falling apart, because the
     /// reason to prune is confidence and there is less of it on the way down.
     eval_stack: [i32; MAX_PLY],
+    /// A move this ply is pretending does not exist, while it finds out
+    /// whether that move was the only one holding the position up.
+    excluded: [Option<Move>; MAX_PLY],
     /// Which plies got there by passing. Two passes in a row prove nothing:
     /// the side to move has effectively been given a free tempo twice, and the
     /// position being searched is not one that can occur.
@@ -227,6 +230,7 @@ impl Searcher {
             pv: [[None; MAX_PLY]; MAX_PLY],
             pv_len: [0; MAX_PLY],
             eval_stack: [0; MAX_PLY],
+            excluded: [None; MAX_PLY],
             null_at: [false; MAX_PLY],
         }
     }
@@ -550,13 +554,18 @@ impl Searcher {
             depth += 1;
         }
 
+        // A node searching with a move excluded is asking a different question
+        // from the one the table answered, so it must not take the answer --
+        // nor leave its own answer behind for a node that is asking the
+        // ordinary question.
+        let excluded = self.excluded[ply];
         let entry = self.tt.probe(board.hash);
         let mut tt_move = None;
         let mut tt_pv = pv_node;
         if let Some(e) = entry {
             tt_move = e.best;
             tt_pv |= e.pv;
-            if !pv_node && e.depth >= depth && e.has_bound() {
+            if excluded.is_none() && !pv_node && e.depth >= depth && e.has_bound() {
                 let s = score_from_tt(e.score, ply);
                 let usable = match e.bound {
                     Bound::Exact => true,
@@ -661,10 +670,61 @@ impl Searcher {
         let alpha_orig = alpha;
         let mut searched_quiets: Vec<Move> = Vec::new();
 
+        let tt_score_for_singular = entry
+            .filter(|e| e.has_bound())
+            .map(|e| score_from_tt(e.score, ply));
+
         for i in 0..moves.len() {
             Self::pick(&mut moves, &mut scores, i);
             let mv = moves[i];
+            if Some(mv) == excluded {
+                continue;
+            }
             let is_quiet = !mv.is_capture() && mv.promotion.is_none();
+            let mut extension = 0;
+
+            // Singular extension. If the table says this move is good enough to
+            // fail high, search every OTHER move against a window just below
+            // that. If they all fall short, this move is the only one holding
+            // the position up, and a line that hangs on one move deserves
+            // another ply to be sure of it.
+            if !root
+                && excluded.is_none()
+                && Some(mv) == tt_move
+                && depth >= 6
+                && ply < MAX_PLY - 8
+            {
+                if let Some(ts) = tt_score_for_singular {
+                    let e = entry.unwrap();
+                    if e.depth >= depth - 3
+                        && matches!(e.bound, Bound::Lower | Bound::Exact)
+                        && !is_mate(ts)
+                    {
+                        let target = ts - 2 * depth;
+                        self.excluded[ply] = Some(mv);
+                        let s = self.negamax(
+                            board,
+                            (depth - 1) / 2,
+                            target - 1,
+                            target,
+                            ply,
+                            false,
+                        );
+                        self.excluded[ply] = None;
+                        if self.stopped {
+                            return 0;
+                        }
+                        if s < target {
+                            extension = 1;
+                        } else if target >= beta {
+                            // Every other move also beats beta, so the position
+                            // is winning for reasons that do not depend on this
+                            // one and the whole subtree can go.
+                            return target;
+                        }
+                    }
+                }
+            }
 
             // Everything here needs a score already in hand: without one, the
             // node has nothing to compare a margin against and skipping moves
@@ -706,9 +766,11 @@ impl Searcher {
             self.tt.prefetch(board.hash);
             self.keys.push(board.hash);
 
+            let new_depth = depth - 1 + extension;
+
             let mut score;
             if i == 0 {
-                score = -self.negamax(board, depth - 1, -beta, -alpha, ply + 1, pv_node);
+                score = -self.negamax(board, new_depth, -beta, -alpha, ply + 1, pv_node);
             } else {
                 // Late move reductions: the ordering has already put the moves
                 // most likely to be best first, so the ones at the back are
@@ -727,14 +789,14 @@ impl Searcher {
                     // A move the history likes gets the benefit of the doubt,
                     // one it dislikes gets less of it.
                     r -= (scores[i] / 4096).clamp(-2, 2);
-                    r = r.clamp(0, depth - 2);
+                    r = r.clamp(0, (new_depth - 1).max(0));
                 }
-                score = -self.negamax(board, depth - 1 - r, -alpha - 1, -alpha, ply + 1, false);
+                score = -self.negamax(board, new_depth - r, -alpha - 1, -alpha, ply + 1, false);
                 if score > alpha && r > 0 {
-                    score = -self.negamax(board, depth - 1, -alpha - 1, -alpha, ply + 1, false);
+                    score = -self.negamax(board, new_depth, -alpha - 1, -alpha, ply + 1, false);
                 }
                 if score > alpha && score < beta {
-                    score = -self.negamax(board, depth - 1, -beta, -alpha, ply + 1, pv_node);
+                    score = -self.negamax(board, new_depth, -beta, -alpha, ply + 1, pv_node);
                 }
             }
 
@@ -780,6 +842,10 @@ impl Searcher {
             }
         }
 
+        if best_score == -INF {
+            return alpha;
+        }
+
         // Learn the correction from what the search ended up saying, but only
         // where it contradicts the static score in a direction worth trusting:
         // below it and below beta, so there is an upper bound proving the
@@ -809,15 +875,17 @@ impl Searcher {
         } else {
             static_eval as i16
         };
-        self.tt.store(
-            board.hash,
-            depth,
-            score_to_tt(best_score, ply),
-            bound,
-            best_move,
-            tt_pv,
-            se,
-        );
+        if excluded.is_none() {
+            self.tt.store(
+                board.hash,
+                depth,
+                score_to_tt(best_score, ply),
+                bound,
+                best_move,
+                tt_pv,
+                se,
+            );
+        }
 
         best_score
     }
