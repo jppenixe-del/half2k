@@ -222,20 +222,27 @@ impl Searcher {
         // just without having thought about it.
         let usable = time.saturating_sub(self.move_overhead).max(1);
 
-        let mtg = limits.movestogo.unwrap_or(0);
-        let soft = if mtg > 0 {
-            // A real move count to reach: spread what is left over it, with a
-            // little extra for the move in hand.
-            usable / mtg.max(1) + inc / 2
-        } else {
-            // Sudden death or increment: assume the game has a while to run.
-            usable / 20 + inc * 3 / 4
-        };
+        // How many more moves to plan for. With a real count given, use it.
+        // Without one, twenty-five is a deliberately pessimistic guess: games
+        // that end sooner leave time unspent, which costs a little strength,
+        // while games that run longer flag, which costs the whole point.
+        let mtg = limits.movestogo.unwrap_or(25).max(1);
 
-        // The wall never lets a single move eat the whole clock, and never
-        // exceeds what is ours in the first place.
-        let hard = (usable / 3).min(usable);
-        let soft = soft.min(hard);
+        // The increment is income, so most of it can be spent every move
+        // without the clock moving. Not all of it: the part held back is what
+        // slowly rebuilds a buffer over a long game.
+        let base = usable / mtg + inc * 3 / 4;
+
+        // Two ceilings on the wall, and the second is the one that matters.
+        //
+        // Three times the plan lets a single critical move think properly.
+        // Two fifths of what is left stops that from being a way to spend the
+        // clock: the first version had a wall at a third of the clock with no
+        // second ceiling, and over a forty-seven move game the drain was
+        // gradual rather than dramatic -- no single move looked wrong, the
+        // longest was 1.2 seconds, and it still ran out.
+        let hard = (base * 3).min(usable * 2 / 5);
+        let soft = base.min(hard);
 
         self.soft = Duration::from_millis(soft.max(1));
         self.hard = Duration::from_millis(hard.max(1));
@@ -543,6 +550,19 @@ impl Searcher {
 
             if self.stopped {
                 return 0;
+            }
+
+            // At the root, and only there, give up on an iteration that has
+            // already gone well past what was planned for the whole move. The
+            // soft limit is otherwise consulted only between iterations, so a
+            // single long one sails past it and the wall is all that catches
+            // it -- much later, and much more expensively.
+            //
+            // Safe to stop here because a root move that has finished has a
+            // real score: the best so far is a genuine best-so-far, not
+            // whatever happened to be first.
+            if root && i > 0 && self.start.elapsed() >= self.soft * 2 {
+                self.stopped = true;
             }
 
             if score > best_score {
