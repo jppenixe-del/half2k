@@ -452,7 +452,7 @@ impl Searcher {
 
         if !root {
             if self.is_draw(board) {
-                return 0;
+                return self.draw_score();
             }
             if ply >= MAX_PLY - 1 {
                 return crate::search::debug_eval(board, false);
@@ -791,7 +791,7 @@ impl Searcher {
             return crate::search::debug_eval(board, false);
         }
         if self.is_draw(board) {
-            return 0;
+            return self.draw_score();
         }
         let in_check = board.in_check(board.side, &self.atk);
         let a = alpha.max(-crate::search::MATE + ply as i32);

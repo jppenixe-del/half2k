@@ -235,6 +235,18 @@ pub struct Params {
     /// A check is only worth extending for when the position is not already
     /// decided.
     pub check_ext_eval: i32,
+    /// What a draw is worth to the side to move, in the units the network
+    /// speaks, where two are a centipawn.
+    ///
+    /// Zero means a draw is a draw. Above zero means the engine would rather
+    /// keep playing than repeat, which is worth something when the opponent
+    /// evaluates positions the same way we do -- against an engine sharing our
+    /// network, agreement about what is equal turns into a repetition, and half
+    /// the games end that way.
+    ///
+    /// It is not free: an engine that refuses a draw it should take loses games
+    /// it should have halved. Small, and measured.
+    pub contempt: i32,
     pub see_prune: i32,
     /// x100
     pub lmr_base: i32,
@@ -298,6 +310,7 @@ impl Default for Params {
             see_prune: 70,
             see_prune_quiet: 5,
             check_ext_eval: 75,
+            contempt: 0,
             lmr_base: 77,
             lmr_div: 236,
             lmr_cut: 2,
@@ -347,6 +360,7 @@ pub const PARAM_SPECS: &[ParamSpec] = &[
     ("SeePrune", |p| p.see_prune, |p, v| p.see_prune = v, 20, 250),
     ("SeePruneQuiet", |p| p.see_prune_quiet, |p, v| p.see_prune_quiet = v, 1, 40),
     ("CheckExtEval", |p| p.check_ext_eval, |p, v| p.check_ext_eval = v, 0, 400),
+    ("Contempt", |p| p.contempt, |p, v| p.contempt = v, 0, 100),
     ("LmrBase", |p| p.lmr_base, |p, v| p.lmr_base = v, 0, 200),
     ("LmrDiv", |p| p.lmr_div, |p, v| p.lmr_div = v, 120, 400),
     ("LmrCut", |p| p.lmr_cut, |p, v| p.lmr_cut = v, 0, 4),
@@ -1021,6 +1035,17 @@ impl Searcher {
         board.halfmove >= 100 || self.is_repetition(board)
     }
 
+    /// What a drawn position is worth to the side to move.
+    ///
+    /// Negative by `contempt`, so that repeating is worse than continuing. The
+    /// sign matters and is easy to get backwards: this is returned from the
+    /// point of view of whoever is to move, and it is THEY who should be
+    /// reluctant.
+    #[inline]
+    pub(crate) fn draw_score(&self) -> i32 {
+        -self.params.contempt
+    }
+
     pub fn go(&mut self, board: &mut Board, limits: &Limits, info: bool) -> Option<Move> {
         self.allocate(limits, board);
         self.nodes = 0;
@@ -1260,7 +1285,7 @@ impl Searcher {
 
         if !root {
             if self.is_draw(board) {
-                return 0;
+                return self.draw_score();
             }
             if ply >= MAX_PLY - 1 {
                 return evaluate(board, self.features.rule50_fade);
@@ -1941,7 +1966,7 @@ impl Searcher {
             return evaluate(board, self.features.rule50_fade);
         }
         if self.is_draw(board) {
-            return 0;
+            return self.draw_score();
         }
 
         let in_check = board.in_check(board.side, &self.atk);
