@@ -71,6 +71,37 @@ fn corr_index(board: &Board) -> usize {
     ((z ^ (z >> 31)) as usize) & (CORR_SIZE - 1)
 }
 
+/// How many continuation tables, and how far back each looks.
+pub const CONT_SLOTS: usize = 3;
+pub const CONT_BACK: [usize; CONT_SLOTS] = [1, 2, 4];
+/// Weight per slot when scoring, the reply carrying twice the rest.
+pub const CONT_WEIGHT: [i32; CONT_SLOTS] = [2, 1, 1];
+
+/// Where a history entry settles. Separate ceilings because the two tables
+/// answer different questions and the continuation one is asked more precisely,
+/// so it is allowed to be more emphatic.
+const HIST_MAX_MAIN: i32 = 15000;
+const HIST_MAX_CONT: i32 = 30000;
+
+/// What one cutoff is worth, by the depth that found it.
+///
+/// Linear and generous. It was `min(1200, d*d)` -- at depth ten that is a
+/// hundred against two thousand, so the tables took eighty cutoffs to reach
+/// where they now reach in six, and move ordering spent most of its time acting
+/// on information that had gone stale. Ordering is what decides whether late
+/// move reductions are reducing the right moves, so this is not a small thing.
+#[inline]
+fn hist_bonus(depth: i32) -> i32 {
+    (200 * depth).min(4000)
+}
+
+/// Move towards the ceiling by an amount that shrinks as it is approached, so
+/// an entry saturates instead of running away.
+#[inline]
+fn hist_add(entry: &mut i32, bonus: i32, max: i32) {
+    *entry += bonus - *entry * bonus.abs() / max;
+}
+
 pub const MAX_PLY: usize = 128;
 pub const INF: i32 = 32_000;
 pub const MATE: i32 = 31_000;
@@ -154,15 +185,15 @@ impl Default for Params {
             fut_base: 100,
             fut_slope: 150,
             fut_depth: 12,
-            fut_hist_div: 14,
-            hist_prune: 109,
+            fut_hist_div: 75,
+            hist_prune: 600,
             see_prune: 70,
             see_prune_quiet: 5,
             check_ext_eval: 75,
             lmr_base: 77,
             lmr_div: 236,
             lmr_cut: 2,
-            lmr_hist_div: 4096,
+            lmr_hist_div: 22000,
             asp_delta: 25,
             asp_depth: 4,
             sing_depth: 5,
@@ -195,15 +226,15 @@ pub const PARAM_SPECS: &[ParamSpec] = &[
     ("FutBase", |p| p.fut_base, |p, v| p.fut_base = v, 20, 400),
     ("FutSlope", |p| p.fut_slope, |p, v| p.fut_slope = v, 30, 300),
     ("FutDepth", |p| p.fut_depth, |p, v| p.fut_depth = v, 2, 16),
-    ("FutHistDiv", |p| p.fut_hist_div, |p, v| p.fut_hist_div = v, 4, 60),
-    ("HistPrune", |p| p.hist_prune, |p, v| p.hist_prune = v, 20, 800),
+    ("FutHistDiv", |p| p.fut_hist_div, |p, v| p.fut_hist_div = v, 20, 200),
+    ("HistPrune", |p| p.hist_prune, |p, v| p.hist_prune = v, 100, 2000),
     ("SeePrune", |p| p.see_prune, |p, v| p.see_prune = v, 20, 250),
     ("SeePruneQuiet", |p| p.see_prune_quiet, |p, v| p.see_prune_quiet = v, 1, 40),
     ("CheckExtEval", |p| p.check_ext_eval, |p, v| p.check_ext_eval = v, 0, 400),
     ("LmrBase", |p| p.lmr_base, |p, v| p.lmr_base = v, 0, 200),
     ("LmrDiv", |p| p.lmr_div, |p, v| p.lmr_div = v, 120, 400),
     ("LmrCut", |p| p.lmr_cut, |p, v| p.lmr_cut = v, 0, 4),
-    ("LmrHistDiv", |p| p.lmr_hist_div, |p, v| p.lmr_hist_div = v, 512, 16384),
+    ("LmrHistDiv", |p| p.lmr_hist_div, |p, v| p.lmr_hist_div = v, 4096, 65536),
     ("AspDelta", |p| p.asp_delta, |p, v| p.asp_delta = v, 8, 80),
     ("AspDepth", |p| p.asp_depth, |p, v| p.asp_depth = v, 2, 10),
     ("SingDepth", |p| p.sing_depth, |p, v| p.sing_depth = v, 4, 12),
@@ -397,8 +428,9 @@ pub struct Searcher {
     /// history is indexed by this: a move is good or bad largely in reply to
     /// something, and a table that ignores what came before cannot say which.
     played: [Option<(usize, usize)>; MAX_PLY],
-    /// `[prev piece * 64 + prev to][piece][to]`.
-    conthist: Vec<[[i32; 64]; 6]>,
+    /// `[slot][prev piece * 64 + prev to][piece][to]`, one table per distance
+    /// back.
+    conthist: Vec<Vec<[[i32; 64]; 6]>>,
     /// Zobrist keys along the path plus the game so far, for repetition.
     keys: Vec<u64>,
     /// How many of `keys` are game history rather than search path.
@@ -532,7 +564,7 @@ impl Searcher {
             history: [[[0; 64]; 64]; 2],
             corr: vec![[0; CORR_SIZE]; 2],
             played: [None; MAX_PLY],
-            conthist: vec![[[0; 64]; 6]; 6 * 64],
+            conthist: vec![vec![[[0; 64]; 6]; 6 * 64]; CONT_SLOTS],
             keys: Vec::with_capacity(1024),
             root_keys: 0,
             pv: [[None; MAX_PLY]; MAX_PLY],
@@ -560,7 +592,7 @@ impl Searcher {
         self.killers = [[None; 2]; MAX_PLY];
         self.history = [[[0; 64]; 64]; 2];
         self.corr = vec![[0; CORR_SIZE]; 2];
-        self.conthist = vec![[[0; 64]; 6]; 6 * 64];
+        self.conthist = vec![vec![[[0; 64]; 6]; 6 * 64]; CONT_SLOTS];
     }
 
     /// The static score, adjusted by what the search has been saying about
@@ -581,11 +613,16 @@ impl Searcher {
         *e = ((*e * (256 - w) + target * w) / 256).clamp(-CORR_MAX, CORR_MAX);
     }
 
-    /// The continuation tables in reach at this ply: one ply back and two.
+    /// Which continuation table each slot points at, this ply.
+    ///
+    /// One, two and four plies back. The first is the move being replied to and
+    /// carries twice the weight of the others: what makes a quiet move good is
+    /// most often what the opponent just did, and only after that what we were
+    /// doing before.
     #[inline]
-    fn cont_slots(&self, ply: usize) -> [Option<usize>; 2] {
-        let mut out = [None; 2];
-        for (k, back) in [1usize, 2].iter().enumerate() {
+    fn cont_slots(&self, ply: usize) -> [Option<usize>; CONT_SLOTS] {
+        let mut out = [None; CONT_SLOTS];
+        for (k, back) in CONT_BACK.iter().enumerate() {
             if ply >= *back {
                 if let Some((pc, to)) = self.played[ply - back] {
                     out[k] = Some(pc * 64 + to);
@@ -1674,27 +1711,40 @@ impl Searcher {
             self.killers[ply][0] = Some(mv);
         }
         let side = board.side.idx();
-        let bonus = (depth * depth).min(1200);
+        let bonus = hist_bonus(depth);
         let slots = self.cont_slots(ply);
 
-        // Saturating: without the pull towards zero a few deep cutoffs pin an
-        // entry at the ceiling and it stops carrying information.
-        let h = &mut self.history[side][mv.from as usize][mv.to as usize];
-        *h += bonus - *h * bonus / 8192;
-        if let Some(pc) = board.piece_at(mv.from).map(|(pt, _)| pt.idx()) {
-            for slot in slots.into_iter().flatten() {
-                let c = &mut self.conthist[slot][pc][mv.to as usize];
-                *c += bonus - *c * bonus / 8192;
+        self.credit(board, mv, side, &slots, bonus);
+        for q in searched {
+            if *q != mv {
+                self.credit(board, *q, side, &slots, -bonus);
             }
         }
+    }
 
-        for q in searched {
-            let h = &mut self.history[side][q.from as usize][q.to as usize];
-            *h += -bonus - *h * bonus / 8192;
-            if let Some(pc) = board.piece_at(q.from).map(|(pt, _)| pt.idx()) {
-                for slot in slots.into_iter().flatten() {
-                    let c = &mut self.conthist[slot][pc][q.to as usize];
-                    *c += -bonus - *c * bonus / 8192;
+    /// Move one move for and every other move against, by the same amount.
+    #[inline]
+    fn credit(
+        &mut self,
+        board: &Board,
+        mv: Move,
+        side: usize,
+        slots: &[Option<usize>; CONT_SLOTS],
+        bonus: i32,
+    ) {
+        hist_add(
+            &mut self.history[side][mv.from as usize][mv.to as usize],
+            bonus,
+            HIST_MAX_MAIN,
+        );
+        if let Some(pc) = board.piece_at(mv.from).map(|(pt, _)| pt.idx()) {
+            for (k, slot) in slots.iter().enumerate() {
+                if let Some(idx) = slot {
+                    hist_add(
+                        &mut self.conthist[k][*idx][pc][mv.to as usize],
+                        bonus,
+                        HIST_MAX_CONT,
+                    );
                 }
             }
         }
@@ -1753,8 +1803,11 @@ impl Searcher {
                 } else {
                     let mut h = self.history[side][mv.from as usize][mv.to as usize];
                     if let Some(pc) = board.piece_at(mv.from).map(|(pt, _)| pt.idx()) {
-                        for slot in slots.into_iter().flatten() {
-                            h += self.conthist[slot][pc][mv.to as usize];
+                        for (k, slot) in slots.iter().enumerate() {
+                            if let Some(idx) = slot {
+                                h += CONT_WEIGHT[k]
+                                    * self.conthist[k][*idx][pc][mv.to as usize];
+                            }
                         }
                     }
                     h
