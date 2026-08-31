@@ -100,6 +100,8 @@ pub struct Features {
     /// In quiescence, skip a capture that cannot come near alpha even if it
     /// wins everything it takes.
     pub qs_futility: bool,
+    /// Spend less when most of the tree went to the move that won anyway.
+    pub tm_node_effort: bool,
 
     /// Reduce harder at a node that is expected to fail high.
     ///
@@ -110,6 +112,9 @@ pub struct Features {
 
     /// Skip a quiet move the history has consistently disliked.
     pub history_prune: bool,
+    /// Spend longer when the score is falling, less when the best move has
+    /// stopped changing.
+    pub tm_stability: bool,
 
     /// Reduce late captures too, not only late quiet moves.
     pub lmr_captures: bool,
@@ -125,8 +130,10 @@ impl Default for Features {
             iir: false,
             lmp_improving: false,
             qs_futility: false,
+            tm_node_effort: false,
             cut_node_lmr: true,
             history_prune: true,
+            tm_stability: true,
             lmr_captures: true,
         }
     }
@@ -143,8 +150,10 @@ impl Features {
             "iir" => self.iir = on,
             "lmpimproving" => self.lmp_improving = on,
             "qsfutility" => self.qs_futility = on,
+            "tmnodeeffort" => self.tm_node_effort = on,
             "cutnodelmr" => self.cut_node_lmr = on,
             "historyprune" => self.history_prune = on,
+            "tmstability" => self.tm_stability = on,
             "lmrcaptures" => self.lmr_captures = on,
             _ => return false,
         }
@@ -152,7 +161,7 @@ impl Features {
     }
 
     /// The ones the reference does not have. All default off.
-    pub const EXTRA: [&'static str; 7] = [
+    pub const EXTRA: [&'static str; 8] = [
         "CorrHist",
         "Razoring",
         "Rule50Fade",
@@ -160,10 +169,12 @@ impl Features {
         "IIR",
         "LmpImproving",
         "QsFutility",
+        "TmNodeEffort",
     ];
 
     /// The ones it does have, so they are in the baseline. All default on.
-    pub const BASELINE: [&'static str; 3] = ["CutNodeLmr", "HistoryPrune", "LmrCaptures"];
+    pub const BASELINE: [&'static str; 4] =
+        ["CutNodeLmr", "HistoryPrune", "LmrCaptures", "TmStability"];
 }
 
 #[derive(Default, Clone)]
@@ -224,6 +235,10 @@ pub struct Searcher {
     /// A move this ply is pretending does not exist, while it finds out
     /// whether that move was the only one holding the position up.
     excluded: [Option<Move>; MAX_PLY],
+    /// How many nodes each root move cost this iteration. A move that took
+    /// most of the tree and still came out best was not a close call, and time
+    /// management can read that.
+    root_effort: Vec<(Move, u64)>,
     /// Which plies got there by passing. Two passes in a row prove nothing:
     /// the side to move has effectively been given a free tempo twice, and the
     /// position being searched is not one that can occur.
@@ -343,6 +358,7 @@ impl Searcher {
             pv_len: [0; MAX_PLY],
             eval_stack: [0; MAX_PLY],
             excluded: [None; MAX_PLY],
+            root_effort: Vec::with_capacity(256),
             null_at: [false; MAX_PLY],
         }
     }
@@ -513,8 +529,16 @@ impl Searcher {
         let mut best: Option<Move> = None;
         let mut best_score = 0;
 
+        // Time management state that only makes sense across iterations.
+        let mut last_best: Option<Move> = None;
+        let mut best_move_changes = 0i32;
+        let mut iters_since_change = 0i32;
+        let mut average_score = 0i32;
+        let base_soft = self.soft;
+
         for depth in 1..=max_depth {
             let iter_start = self.start.elapsed();
+            self.root_effort.clear();
             let score = self.aspiration(board, depth as i32, best_score);
 
             // An aborted iteration has searched only part of the move list, so
@@ -536,6 +560,60 @@ impl Searcher {
             if limits.nodes.map_or(false, |n| self.nodes >= n) {
                 break;
             }
+
+            // What the position is telling us about how long to keep going.
+            //
+            // Three signals, and they answer different questions. A score that
+            // is falling means the move we have is worse than we thought and
+            // the alternatives deserve another look. A best move that has
+            // stopped changing means the answer has settled and more time buys
+            // nothing. And a move that took most of the tree to itself and
+            // still came out on top was never a close call.
+            if depth == 1 {
+                average_score = score;
+            } else {
+                average_score = (score + 9 * average_score) / 10;
+            }
+            if best != last_best {
+                last_best = best;
+                iters_since_change = 0;
+                best_move_changes += 1;
+            } else {
+                iters_since_change += 1;
+            }
+
+            let mut factor = 1.0f64;
+            if self.features.tm_stability {
+                // Falling score. The divisor is in the units the network
+                // speaks, where two are a centipawn, so a hundred of them is
+                // half a pawn -- the point at which a drop is worth real time.
+                let fall = 1.0 + (average_score - score) as f64 / 100.0;
+                factor *= fall.clamp(1.0, 1.75);
+
+                let d = (2.0 * depth as f64).max(1.0);
+                let steady = (1.0 - iters_since_change as f64 / d).clamp(0.75, 1.0);
+                let restless = (0.9 + best_move_changes as f64 / d).clamp(1.0, 1.5);
+                factor *= steady * restless;
+            }
+            if self.features.tm_node_effort {
+                let spent: u64 = self.root_effort.iter().map(|(_, n)| *n).sum();
+                let on_best = best
+                    .and_then(|b| self.root_effort.iter().find(|(m, _)| *m == b))
+                    .map(|(_, n)| *n)
+                    .unwrap_or(0);
+                if spent > 0 {
+                    // All of the tree on one move means nothing else was even
+                    // close; an even split means the position is genuinely
+                    // unclear and worth more time.
+                    let share = on_best as f64 / spent as f64;
+                    factor *= (1.6 - share).clamp(0.6, 1.3);
+                }
+            }
+
+            // The scaling moves the plan, never the wall. Whatever the position
+            // says, a move cannot spend more than the clock allows.
+            let soft = base_soft.mul_f64(factor.clamp(0.4, 2.0)).min(self.hard);
+            self.soft = soft;
 
             // Is there room for another iteration, not is there room for the
             // one just finished.
@@ -904,6 +982,7 @@ impl Searcher {
                 }
             }
 
+            let nodes_before = self.nodes;
             self.played[ply] = board
                 .piece_at(mv.from)
                 .map(|(pt, _)| (pt.idx(), mv.to as usize));
@@ -986,6 +1065,10 @@ impl Searcher {
 
             self.keys.pop();
             board.unmake_move(&mv, &undo);
+
+            if root {
+                self.root_effort.push((mv, self.nodes - nodes_before));
+            }
 
             if self.stopped {
                 return 0;
