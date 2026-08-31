@@ -71,6 +71,13 @@ pub fn main_loop() {
                     searcher.move_overhead
                 );
                 println!("option name EvalFile type string default <empty>");
+                // Off by default, every one of them: out of the box the search
+                // uses the same set of ideas as the reference this network was
+                // trained against, so anything switched on has a number of its
+                // own rather than being lost in a pile of simultaneous changes.
+                for name in crate::search::Features::NAMES {
+                    println!("option name {} type check default false", name);
+                }
                 println!("uciok");
             }
             "isready" => {
@@ -105,8 +112,10 @@ pub fn main_loop() {
                             if let Ok(mb) = value.parse::<usize>() {
                                 hash_mb = mb.clamp(1, 65536);
                                 let mo = searcher.move_overhead;
+                                let ft = searcher.features;
                                 searcher = Searcher::new(hash_mb, stop.clone());
                                 searcher.move_overhead = mo;
+                                searcher.features = ft;
                             }
                         }
                         "move overhead" => {
@@ -118,7 +127,10 @@ pub fn main_loop() {
                             net_path = value;
                             net_loaded = false;
                         }
-                        _ => {}
+                        other => {
+                            let on = value.eq_ignore_ascii_case("true");
+                            searcher.features.set(other, on);
+                        }
                     }
                 }
             }
@@ -192,7 +204,7 @@ pub fn main_loop() {
             "quit" => break,
             "eval" => {
                 let side = board.side;
-                let s = crate::search::debug_eval(&board);
+                let s = crate::search::debug_eval(&board, searcher.features.rule50_fade);
                 let (w, d, l) = nnue::wdl(s);
                 println!(
                     "eval {} (side to move: {}) wdl {} {} {}",

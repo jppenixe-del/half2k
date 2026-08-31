@@ -75,6 +75,68 @@ pub const MATE: i32 = 31_000;
 /// Anything at least this large is a mate score, not an evaluation.
 pub const MATE_IN_MAX: i32 = MATE - MAX_PLY as i32;
 
+/// The techniques that the program this network was trained against does not
+/// have.
+///
+/// Every one is off by default, so the engine out of the box searches with the
+/// same set of ideas as that reference. What each is worth then has an answer
+/// rather than an opinion: turn exactly one on, play a match, read the number.
+/// A feature that cannot be switched off is a feature nobody ever measured.
+#[derive(Clone, Copy)]
+pub struct Features {
+    /// Learn how wrong the static evaluation usually is for a pawn structure,
+    /// and feed it back.
+    pub corr_hist: bool,
+    /// Ask quiescence directly when a node is far enough behind.
+    pub razoring: bool,
+    /// Fade the evaluation towards a draw as the fifty move counter runs out.
+    pub rule50_fade: bool,
+    /// Reduce less at a node that once earned a full window.
+    pub ttpv_lmr: bool,
+    /// Search a ply shallower when the table has no move to try first.
+    pub iir: bool,
+    /// Cut the late move count in half when things are not improving.
+    pub lmp_improving: bool,
+}
+
+impl Default for Features {
+    fn default() -> Self {
+        Features {
+            corr_hist: false,
+            razoring: false,
+            rule50_fade: false,
+            ttpv_lmr: false,
+            iir: false,
+            lmp_improving: false,
+        }
+    }
+}
+
+impl Features {
+    /// UCI option name to field, for `setoption`.
+    pub fn set(&mut self, name: &str, on: bool) -> bool {
+        match name {
+            "corrhist" => self.corr_hist = on,
+            "razoring" => self.razoring = on,
+            "rule50fade" => self.rule50_fade = on,
+            "ttpvlmr" => self.ttpv_lmr = on,
+            "iir" => self.iir = on,
+            "lmpimproving" => self.lmp_improving = on,
+            _ => return false,
+        }
+        true
+    }
+
+    pub const NAMES: [&'static str; 6] = [
+        "CorrHist",
+        "Razoring",
+        "Rule50Fade",
+        "TtPvLmr",
+        "IIR",
+        "LmpImproving",
+    ];
+}
+
 #[derive(Default, Clone)]
 pub struct Limits {
     pub wtime: Option<u64>,
@@ -100,6 +162,7 @@ pub struct Searcher {
     /// is deliberately generous, because the cost of being wrong is asymmetric:
     /// too large loses a little strength, too small loses whole games.
     pub move_overhead: u64,
+    pub features: Features,
 
     nodes: u64,
     start: Instant,
@@ -139,7 +202,7 @@ pub struct Searcher {
 }
 
 /// The score of a position from the side to move's point of view.
-fn evaluate(board: &Board) -> i32 {
+fn evaluate(board: &Board, fade: bool) -> i32 {
     let net = match nnue::net() {
         Some(n) => n,
         None => return 0,
@@ -154,7 +217,11 @@ fn evaluate(board: &Board) -> i32 {
     // on positions is confident about a position that is about to stop counting
     // for anything, and without this the search happily walks into a draw it
     // thinks it is winning.
-    raw * (200 - board.halfmove.min(100) as i32) / 200
+    if fade {
+        raw * (200 - board.halfmove.min(100) as i32) / 200
+    } else {
+        raw
+    }
 }
 
 /// Does this side have anything but pawns and a king?
@@ -172,8 +239,8 @@ fn has_pieces(board: &Board, side: Color) -> bool {
 }
 
 /// The evaluation, exposed for the UCI `eval` command.
-pub fn debug_eval(board: &Board) -> i32 {
-    evaluate(board)
+pub fn debug_eval(board: &Board, fade: bool) -> i32 {
+    evaluate(board, fade)
 }
 
 fn mate_score(ply: usize) -> i32 {
@@ -215,6 +282,7 @@ impl Searcher {
             atk: Attacks::new(),
             stop,
             move_overhead: 30,
+            features: Features::default(),
             nodes: 0,
             start: Instant::now(),
             soft: Duration::from_secs(0),
@@ -539,7 +607,7 @@ impl Searcher {
                 return 0;
             }
             if ply >= MAX_PLY - 1 {
-                return evaluate(board);
+                return evaluate(board, self.features.rule50_fade);
             }
             // Mate distance pruning: no line from here can beat a mate already
             // found closer to the root.
@@ -591,7 +659,7 @@ impl Searcher {
             match entry {
                 Some(e) if e.static_eval != TT_EVAL_NONE => e.static_eval as i32,
                 _ => {
-                    let e = evaluate(board);
+                    let e = evaluate(board, self.features.rule50_fade);
                     self.tt.store_eval_only(board.hash, e as i16);
                     e
                 }
@@ -600,7 +668,7 @@ impl Searcher {
         // The table keeps the raw number, the search uses the corrected one.
         // Deliberately different: the table is shared, and whoever reads it
         // later applies their own correction.
-        let static_eval = if in_check {
+        let static_eval = if in_check || !self.features.corr_hist {
             static_eval
         } else {
             self.corrected(board, static_eval)
@@ -624,7 +692,7 @@ impl Searcher {
             // unlikely to find enough, so ask it directly instead of spending
             // a full width on the answer. If it turns out to be wrong the
             // score comes back above alpha and the node is searched properly.
-            if depth <= 3 && static_eval + 300 * depth < alpha {
+            if self.features.razoring && depth <= 3 && static_eval + 300 * depth < alpha {
                 let q = self.quiescence(board, alpha, alpha + 1, ply);
                 if q < alpha {
                     return q;
@@ -658,7 +726,7 @@ impl Searcher {
         // Nothing in the table for a node this deep means no move worth
         // trying first, and searching at full depth to discover one costs more
         // than finding it a ply shallower and coming back.
-        if depth >= 4 && tt_move.is_none() {
+        if self.features.iir && depth >= 4 && tt_move.is_none() {
             depth -= 1;
         }
 
@@ -737,7 +805,7 @@ impl Searcher {
                     // Late move pruning: past a certain count at low depth,
                     // the ordering has been wrong often enough that the rest
                     // are not worth the nodes.
-                    let count = if improving {
+                    let count = if !self.features.lmp_improving || improving {
                         3 + depth * depth
                     } else {
                         (3 + depth * depth) / 2
@@ -783,7 +851,7 @@ impl Searcher {
                     r = lmr_table()[(depth as usize).min(63)][i.min(63)];
                     // A position that once earned a full window is less likely
                     // to be the throwaway this reduction assumes.
-                    if tt_pv {
+                    if self.features.ttpv_lmr && tt_pv {
                         r -= 1;
                     }
                     if !pv_node {
@@ -857,7 +925,8 @@ impl Searcher {
         // the position. Captures are excluded: there the jump comes from
         // material rather than from misreading, and it would teach the table
         // the wrong thing.
-        if !in_check
+        if self.features.corr_hist
+            && !in_check
             && best_score.abs() < MATE_IN_MAX
             && !best_move.map_or(false, |m| m.is_capture())
             && ((best_score < static_eval && best_score < beta)
@@ -899,7 +968,7 @@ impl Searcher {
             return 0;
         }
         if ply >= MAX_PLY - 1 {
-            return evaluate(board);
+            return evaluate(board, self.features.rule50_fade);
         }
         if self.is_draw(board) {
             return 0;
@@ -936,7 +1005,7 @@ impl Searcher {
         if !in_check {
             static_eval = match entry {
                 Some(e) if e.static_eval != TT_EVAL_NONE => e.static_eval as i32,
-                _ => evaluate(board),
+                _ => evaluate(board, self.features.rule50_fade),
             };
             if static_eval >= beta {
                 return static_eval;
