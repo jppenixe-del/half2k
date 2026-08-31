@@ -328,7 +328,7 @@ impl Default for Features {
             razoring: false,
             rule50_fade: false,
             ttpv_lmr: false,
-            iir: false,
+            iir: true,
             lmp_improving: false,
             qs_futility: false,
             tm_node_effort: false,
@@ -370,12 +370,11 @@ impl Features {
     }
 
     /// The ones the reference does not have. All default off.
-    pub const EXTRA: [&'static str; 12] = [
+    pub const EXTRA: [&'static str; 11] = [
         "CorrHist",
         "Razoring",
         "Rule50Fade",
         "TtPvLmr",
-        "IIR",
         "LmpImproving",
         "QsFutility",
         "TmNodeEffort",
@@ -386,8 +385,8 @@ impl Features {
     ];
 
     /// The ones it does have, so they are in the baseline. All default on.
-    pub const BASELINE: [&'static str; 4] =
-        ["CutNodeLmr", "HistoryPrune", "LmrCaptures", "TmStability"];
+    pub const BASELINE: [&'static str; 5] =
+        ["CutNodeLmr", "HistoryPrune", "LmrCaptures", "TmStability", "IIR"];
 }
 
 #[derive(Default, Clone)]
@@ -914,6 +913,17 @@ impl Searcher {
         };
 
         loop {
+            // Once a bound is this far from level, the window has stopped being
+            // a guess worth narrowing and has become an obstacle: a position
+            // that decided is going to keep failing in the same direction, and
+            // each failure costs a whole re-search to widen by a step.
+            if alpha < -1000 {
+                alpha = -INF;
+            }
+            if beta > 1000 {
+                beta = INF;
+            }
+
             let score = self.negamax(board, depth, alpha, beta, 0, true, false);
             if self.stopped {
                 return score;
@@ -1007,6 +1017,29 @@ impl Searcher {
                 // worth different things depending on how much counter is left,
                 // and the table does not know which one it stored.
                 if usable && board.halfmove < 90 {
+                    // Credit the stored move on the way out. It just caused a
+                    // cutoff, which is the same evidence a searched move would
+                    // have produced, and returning without recording it lets
+                    // the tables go cold in exactly the positions that come
+                    // back most often -- the ones the table keeps answering.
+                    if s >= beta {
+                        if let Some(m) = tt_move {
+                            if !m.is_capture()
+                                && m.promotion.is_none()
+                                && board.piece_at(m.from).is_some()
+                            {
+                                let side = board.side.idx();
+                                let slots = self.cont_slots(ply);
+                                self.credit(board, m, side, &slots, hist_bonus(depth));
+                                if !self.killers[ply].iter().any(|k| *k == Some(m)) {
+                                    for j in (1..NUM_KILLERS).rev() {
+                                        self.killers[ply][j] = self.killers[ply][j - 1];
+                                    }
+                                    self.killers[ply][0] = Some(m);
+                                }
+                            }
+                        }
+                    }
                     return s;
                 }
             }
@@ -1289,7 +1322,12 @@ impl Searcher {
             // Everything here needs a score already in hand: without one, the
             // node has nothing to compare a margin against and skipping moves
             // risks reporting a mate that is not there.
-            if !root && !pv_node && !in_check && best_score > -MATE_IN_MAX {
+            if !root
+                && !pv_node
+                && !in_check
+                && best_score > -MATE_IN_MAX
+                && has_pieces(board, board.side)
+            {
                 if is_quiet {
                     // Late move pruning: past a certain count at low depth,
                     // the ordering has been wrong often enough that the rest
@@ -1621,12 +1659,35 @@ impl Searcher {
                 Some(e) if e.static_eval != TT_EVAL_NONE => e.static_eval as i32,
                 _ => evaluate(board, self.features.rule50_fade),
             };
-            if static_eval >= beta {
-                return static_eval;
+
+            // The floor to stand on is the better of the static score and
+            // whatever the table already established, for the same reason the
+            // full search prefers it: a stored bound on the right side of the
+            // static score came from a search that went and found out. Standing
+            // on the worse number means searching captures to reach a value
+            // already in hand.
+            let mut floor = static_eval;
+            if let Some(e) = entry {
+                if e.has_bound() {
+                    let ts = score_from_tt(e.score, ply);
+                    let better = match e.bound {
+                        Bound::Exact => true,
+                        Bound::Lower => ts > static_eval,
+                        Bound::Upper => ts < static_eval,
+                        Bound::NoBound => false,
+                    };
+                    if better {
+                        floor = ts;
+                    }
+                }
             }
-            if static_eval > alpha {
-                alpha = static_eval;
+            if floor >= beta {
+                return floor;
             }
+            if floor > alpha {
+                alpha = floor;
+            }
+            static_eval = floor;
         }
 
         let mut moves = if in_check {
