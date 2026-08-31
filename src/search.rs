@@ -2273,63 +2273,60 @@ impl Searcher {
             Self::pick(&mut moves, &mut scores, &mut hist_unused, i);
             let mv = moves[i];
 
-            // A capture that loses material cannot raise the floor we are
-            // already standing on, and following it is how quiescence chases
-            // every recapture to the horizon instead of settling.
-            if !in_check && !see::see_ge(&self.atk, board, &mv, 0) {
-                continue;
-            }
-
-            // And a capture that wins everything it takes and is still nowhere
-            // near alpha cannot help either. Quiescence is most of the tree, so
-            // this is the cheapest place in the search to stop looking at moves
-            // that were never going to matter.
+            // The margin first, the exchange second.
             //
-            // The margin is generous on purpose: the price of being wrong here
-            // is missing a tactic, and the whole point of quiescence is not
-            // missing tactics.
+            // Both of these throw captures away and the order decides which one
+            // gets to. The margin asks whether a capture could reach alpha even
+            // if nothing were taken back; the exchange asks whether it loses
+            // material. Running the exchange first hands it every capture the
+            // margin would have dismissed for free, and static exchange is by
+            // far the more expensive question.
             if self.features.qs_futility && !in_check && best.abs() < MATE_IN_MAX {
-                let taken = if mv.flag == MoveFlag::EnPassant {
-                    value_in_eval_units(PieceType::Pawn)
+                // Promotions are exempt. What this test knows how to price is a
+                // captured piece, and a promotion's value is not in what it
+                // takes -- a pawn reaching the last rank changes the position by
+                // more than the margin can express, and pruning it by material
+                // is pruning it for the wrong reason.
+                let captured = if mv.promotion.is_some() {
+                    None
+                } else if mv.flag == MoveFlag::EnPassant {
+                    Some(PieceType::Pawn)
                 } else {
-                    board
-                        .piece_at(mv.to)
-                        .map(|(pt, _)| value_in_eval_units(pt))
-                        .unwrap_or(0)
+                    board.piece_at(mv.to).map(|(pt, _)| pt)
                 };
-                let promo = mv
-                    .promotion
-                    .map(|p| value_in_eval_units(p) - value_in_eval_units(PieceType::Pawn))
-                    .unwrap_or(0);
-                // Measured against the static score, not against the floor
-                // the table raised or lowered. What this test knows how to
-                // correct is a piece value, and a piece value only means
-                // something added to a static evaluation of the same position.
-                // A stored upper bound below the static score makes the floor
-                // pessimistic, and pruning a capture against a pessimistic
-                // floor throws away captures that were good.
-                //
-                // A skipped move still says something. The value it could not
-                // beat is an honest lower bound on what this node is worth --
-                // the capture was not searched, but it was not refuted either,
-                // and if every remaining move is skipped the same way then this
-                // is the best the node can show for itself. Dropping it instead
-                // makes the node return less than it knows, and that
-                // underestimate travels up the tree and into the table.
-                //
-                // That omission was the whole of it. Basing the test on the
-                // static score rather than the table's floor was correct and
-                // was not enough: with the value discarded the switch still
-                // cost 129 Elo, thirty-two percent over sixty-two games.
-                if static_eval != TT_EVAL_NONE as i32 {
-                    let futile = static_eval + taken + promo + 200;
-                    if futile <= alpha {
+
+                // And there has to be something to take. A move with nothing on
+                // the target square was being credited with a captured value of
+                // zero and pruned on that basis, which is not a bound on
+                // anything.
+                if let Some(pt) = captured {
+                    // Measured from the floor the node is standing on, which is
+                    // what the capture has to beat -- not from the raw static
+                    // score. Trying it the other way round was the first thing
+                    // I changed here and it did not help, which was the clue
+                    // that the fault was elsewhere.
+                    let futile = stand + value_in_eval_units(pt) + 200;
+                    if stand != TT_EVAL_NONE as i32 && futile <= alpha {
+                        // The value it could not beat is an honest lower bound
+                        // on this node. The capture was not searched, but it was
+                        // not refuted either, and if every remaining move is
+                        // skipped the same way then this is the best the node
+                        // can show for itself. Dropping it makes the node return
+                        // less than it knows, and the underestimate travels up
+                        // the tree and into the table.
                         if futile > best {
                             best = futile;
                         }
                         continue;
                     }
                 }
+            }
+
+            // A capture that loses material cannot raise the floor we are
+            // already standing on, and following it is how quiescence chases
+            // every recapture to the horizon instead of settling.
+            if !in_check && !see::see_ge(&self.atk, board, &mv, 0) {
+                continue;
             }
 
             let undo = board.make_move(&mv);
