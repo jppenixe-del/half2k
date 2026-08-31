@@ -579,7 +579,11 @@ pub struct Features {
 impl Default for Features {
     fn default() -> Self {
         Features {
-            corr_hist: false,
+            // On by default since 2026-09-01: 1302 games at 16+0.16 put it at
+            // +4.8 Elo either way of 19, which is not a gain anyone can bank but
+            // is not a loss either, and it was measured after the keys were
+            // rebuilt to tell pieces apart -- before that it cost fourteen.
+            corr_hist: true,
             razoring: false,
             rule50_fade: false,
             ttpv_lmr: false,
@@ -633,8 +637,7 @@ impl Features {
     }
 
     /// The ones outside the settled set. All default off.
-    pub const EXTRA: [&'static str; 14] = [
-        "CorrHist",
+    pub const EXTRA: [&'static str; 13] = [
         "Razoring",
         "Rule50Fade",
         "TtPvLmr",
@@ -651,8 +654,9 @@ impl Features {
     ];
 
     /// The ones it does have, so they are in the baseline. All default on.
-    pub const BASELINE: [&'static str; 6] =
-        ["CutNodeLmr", "HistoryPrune", "LmrCaptures", "TmStability", "IIR", "TmNodeEffort"];
+    pub const BASELINE: [&'static str; 7] =
+        ["CutNodeLmr", "HistoryPrune", "LmrCaptures", "TmStability", "IIR", "TmNodeEffort",
+     "CorrHist"];
 }
 
 #[derive(Default, Clone)]
