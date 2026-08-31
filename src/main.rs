@@ -17,6 +17,7 @@ mod movegen;
 mod moves;
 mod nnue;
 mod perft;
+mod refsearch;
 mod search;
 mod see;
 mod tt;

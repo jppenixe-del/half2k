@@ -412,6 +412,12 @@ pub struct Features {
     pub tt_cut_credit: bool,
     /// Remember which captures worked, not only what they take.
     pub capture_hist: bool,
+    /// Use the transcribed search instead of this one.
+    ///
+    /// Not a feature but an experiment: same board, same network, same table,
+    /// same clock, and the search swapped whole. Whichever way it comes out
+    /// says where the difference lives.
+    pub ref_search: bool,
 
     /// Reduce harder at a node that is expected to fail high.
     ///
@@ -447,6 +453,7 @@ impl Default for Features {
             check_ext: false,
             tt_cut_credit: false,
             capture_hist: false,
+            ref_search: false,
             cut_node_lmr: true,
             history_prune: true,
             tm_stability: true,
@@ -473,6 +480,7 @@ impl Features {
             "checkext" => self.check_ext = on,
             "ttcutcredit" => self.tt_cut_credit = on,
             "capturehist" => self.capture_hist = on,
+            "refsearch" => self.ref_search = on,
             "cutnodelmr" => self.cut_node_lmr = on,
             "historyprune" => self.history_prune = on,
             "tmstability" => self.tm_stability = on,
@@ -483,7 +491,7 @@ impl Features {
     }
 
     /// The ones the reference does not have. All default off.
-    pub const EXTRA: [&'static str; 12] = [
+    pub const EXTRA: [&'static str; 13] = [
         "CorrHist",
         "Razoring",
         "Rule50Fade",
@@ -496,6 +504,7 @@ impl Features {
         "CheckExt",
         "TtCutCredit",
         "CaptureHist",
+        "RefSearch",
     ];
 
     /// The ones it does have, so they are in the baseline. All default on.
@@ -532,11 +541,11 @@ pub struct Searcher {
     pub params: Params,
     lmr: [[i32; 64]; 64],
 
-    nodes: u64,
+    pub(crate) nodes: u64,
     start: Instant,
     soft: Duration,
     hard: Duration,
-    stopped: bool,
+    pub(crate) stopped: bool,
 
     killers: [[Option<Move>; NUM_KILLERS]; MAX_PLY],
     history: [[[i32; 64]; 64]; 2],
@@ -559,20 +568,26 @@ pub struct Searcher {
     /// on the square.
     capthist: Vec<[[i32; 6]; 64]>,
     /// Zobrist keys along the path plus the game so far, for repetition.
-    keys: Vec<u64>,
+    pub(crate) keys: Vec<u64>,
     /// How many of `keys` are game history rather than search path.
     root_keys: usize,
 
-    pv: [[Option<Move>; MAX_PLY]; MAX_PLY],
-    pv_len: [usize; MAX_PLY],
+    pub(crate) pv: [[Option<Move>; MAX_PLY]; MAX_PLY],
+    pub(crate) pv_len: [usize; MAX_PLY],
     /// The static score at each ply, so a node can ask whether things have
     /// been getting better for the side to move. A position that is improving
     /// deserves a tighter margin than one that is falling apart, because the
     /// reason to prune is confidence and there is less of it on the way down.
-    eval_stack: [i32; MAX_PLY],
+    pub(crate) eval_stack: [i32; MAX_PLY],
     /// A move this ply is pretending does not exist, while it finds out
     /// whether that move was the only one holding the position up.
-    excluded: [Option<Move>; MAX_PLY],
+    pub(crate) excluded: [Option<Move>; MAX_PLY],
+    /// The move played at each ply, for the transcribed search's continuation
+    /// tables, which index by a move rather than by a piece and square.
+    pub(crate) played_moves: Vec<Option<Move>>,
+    /// The transcribed search keeps its own tables: same shapes and ceilings as
+    /// the reference, which are not the shapes ours uses.
+    pub(crate) ref_hist: crate::refsearch::Histories,
     /// How many nodes each root move cost this iteration. A move that took
     /// most of the tree and still came out best was not a close call, and time
     /// management can read that.
@@ -580,7 +595,7 @@ pub struct Searcher {
     /// Which plies got there by passing. Two passes in a row prove nothing:
     /// the side to move has effectively been given a free tempo twice, and the
     /// position being searched is not one that can occur.
-    null_at: [bool; MAX_PLY],
+    pub(crate) null_at: [bool; MAX_PLY],
 }
 
 /// The score of a position from the side to move's point of view.
@@ -626,6 +641,10 @@ fn value_in_eval_units(pt: PieceType) -> i32 {
 /// The question null move pruning asks: with only pawns left, having to move is
 /// often a disadvantage, so a side that passes and still looks fine proves
 /// nothing about a side that has to play.
+pub(crate) fn has_pieces_pub(board: &Board, side: Color) -> bool {
+    has_pieces(board, side)
+}
+
 fn has_pieces(board: &Board, side: Color) -> bool {
     let p = &board.pieces[side.idx()];
     p[PieceType::Knight.idx()]
@@ -652,7 +671,7 @@ pub fn is_mate(score: i32) -> bool {
 /// was found at, used relative to the root. Without this a mate found deep in
 /// one branch is reported as being that many moves away from wherever the entry
 /// is read next.
-fn score_to_tt(score: i32, ply: usize) -> i32 {
+pub(crate) fn score_to_tt(score: i32, ply: usize) -> i32 {
     if score >= MATE_IN_MAX {
         score + ply as i32
     } else if score <= -MATE_IN_MAX {
@@ -662,7 +681,7 @@ fn score_to_tt(score: i32, ply: usize) -> i32 {
     }
 }
 
-fn score_from_tt(score: i32, ply: usize) -> i32 {
+pub(crate) fn score_from_tt(score: i32, ply: usize) -> i32 {
     if score >= MATE_IN_MAX {
         score - ply as i32
     } else if score <= -MATE_IN_MAX {
@@ -699,6 +718,8 @@ impl Searcher {
             pv_len: [0; MAX_PLY],
             eval_stack: [0; MAX_PLY],
             excluded: [None; MAX_PLY],
+            played_moves: vec![None; MAX_PLY],
+            ref_hist: crate::refsearch::Histories::new(MAX_PLY),
             root_effort: Vec::with_capacity(256),
             null_at: [false; MAX_PLY],
         }
@@ -720,6 +741,7 @@ impl Searcher {
         self.killers = [[None; NUM_KILLERS]; MAX_PLY];
         self.history = [[[0; 64]; 64]; 2];
         self.corr = vec![vec![[0; CORR_SIZE]; 2]; CORR_KINDS];
+        self.ref_hist.clear();
         self.conthist = vec![vec![[[0; 64]; 6]; 6 * 64]; CONT_SLOTS];
         self.capthist = vec![[[0; 6]; 64]; 6];
     }
@@ -895,7 +917,7 @@ impl Searcher {
     }
 
     #[inline]
-    fn out_of_time(&mut self) -> bool {
+    pub(crate) fn out_of_time(&mut self) -> bool {
         if self.stopped {
             return true;
         }
@@ -930,7 +952,7 @@ impl Searcher {
             .any(|k| *k == board.hash)
     }
 
-    fn is_draw(&self, board: &Board) -> bool {
+    pub(crate) fn is_draw(&self, board: &Board) -> bool {
         board.halfmove >= 100 || self.is_repetition(board)
     }
 
@@ -1114,7 +1136,11 @@ impl Searcher {
                 beta = INF;
             }
 
-            let score = self.negamax(board, depth, alpha, beta, 0, true, false);
+            let score = if self.features.ref_search {
+                self.negamax_ref(board, depth, alpha, beta, 0, true, false)
+            } else {
+                self.negamax(board, depth, alpha, beta, 0, true, false)
+            };
             if self.stopped {
                 return score;
             }
@@ -1994,6 +2020,10 @@ impl Searcher {
         );
 
         best
+    }
+
+    pub(crate) fn update_pv_pub(&mut self, ply: usize, mv: Move) {
+        self.update_pv(ply, mv);
     }
 
     fn update_pv(&mut self, ply: usize, mv: Move) {
