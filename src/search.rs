@@ -97,6 +97,9 @@ pub struct Features {
     pub iir: bool,
     /// Cut the late move count in half when things are not improving.
     pub lmp_improving: bool,
+    /// In quiescence, skip a capture that cannot come near alpha even if it
+    /// wins everything it takes.
+    pub qs_futility: bool,
 
     /// Reduce harder at a node that is expected to fail high.
     ///
@@ -121,6 +124,7 @@ impl Default for Features {
             ttpv_lmr: false,
             iir: false,
             lmp_improving: false,
+            qs_futility: false,
             cut_node_lmr: true,
             history_prune: true,
             lmr_captures: true,
@@ -138,6 +142,7 @@ impl Features {
             "ttpvlmr" => self.ttpv_lmr = on,
             "iir" => self.iir = on,
             "lmpimproving" => self.lmp_improving = on,
+            "qsfutility" => self.qs_futility = on,
             "cutnodelmr" => self.cut_node_lmr = on,
             "historyprune" => self.history_prune = on,
             "lmrcaptures" => self.lmr_captures = on,
@@ -147,13 +152,14 @@ impl Features {
     }
 
     /// The ones the reference does not have. All default off.
-    pub const EXTRA: [&'static str; 6] = [
+    pub const EXTRA: [&'static str; 7] = [
         "CorrHist",
         "Razoring",
         "Rule50Fade",
         "TtPvLmr",
         "IIR",
         "LmpImproving",
+        "QsFutility",
     ];
 
     /// The ones it does have, so they are in the baseline. All default on.
@@ -245,6 +251,21 @@ fn evaluate(board: &Board, fade: bool) -> i32 {
     } else {
         raw
     }
+}
+
+/// A piece value in the units the network speaks.
+///
+/// The table that travels with the board is in ordinary centipawns, where a
+/// pawn is 100. This network answers on a scale with two units to the
+/// centipawn, so anything that compares a piece against an evaluation has to
+/// convert. Not converting made the quiescence margin twice as harsh as
+/// intended -- the same class of mistake that made history pruning never fire
+/// at all, in the other direction. Static exchange is exempt: it is centipawns
+/// end to end, input and output, so a threshold handed to it belongs in
+/// centipawns too.
+#[inline]
+fn value_in_eval_units(pt: PieceType) -> i32 {
+    pt.value() * 2
 }
 
 /// Does this side have anything but pawns and a king?
@@ -1129,6 +1150,34 @@ impl Searcher {
             // every recapture to the horizon instead of settling.
             if !in_check && !see::see_ge(&self.atk, board, &mv, 0) {
                 continue;
+            }
+
+            // And a capture that wins everything it takes and is still nowhere
+            // near alpha cannot help either. Quiescence is most of the tree, so
+            // this is the cheapest place in the search to stop looking at moves
+            // that were never going to matter.
+            //
+            // The margin is generous on purpose: the price of being wrong here
+            // is missing a tactic, and the whole point of quiescence is not
+            // missing tactics.
+            if self.features.qs_futility && !in_check && best.abs() < MATE_IN_MAX {
+                let taken = if mv.flag == MoveFlag::EnPassant {
+                    value_in_eval_units(PieceType::Pawn)
+                } else {
+                    board
+                        .piece_at(mv.to)
+                        .map(|(pt, _)| value_in_eval_units(pt))
+                        .unwrap_or(0)
+                };
+                let promo = mv
+                    .promotion
+                    .map(|p| value_in_eval_units(p) - value_in_eval_units(PieceType::Pawn))
+                    .unwrap_or(0);
+                if static_eval != TT_EVAL_NONE as i32
+                    && static_eval + taken + promo + 200 <= alpha
+                {
+                    continue;
+                }
             }
 
             let undo = board.make_move(&mv);
