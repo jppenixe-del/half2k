@@ -74,20 +74,27 @@ const CORR_MAX_UPDATE: i32 = CORR_MAX / 4;
 /// How much each reading is trusted, out of the divisor below.
 ///
 /// Not an average. The tables answer different questions and are not equally
-/// good at it -- pawn structure says the most, the pieces that are left say
-/// less, and what was just played says something else again. Taken from a
-/// reference where these were tuned over games rather than chosen.
-const CORR_WEIGHT: [i32; CORR_KINDS] = [196, 176, 101, 168, 150];
+/// good at it: the pawn structure says the most by a wide margin, what remains
+/// of each side's force says less, and the shape of the last move says less
+/// again. Proportions taken from an engine where they were tuned over games.
+const CORR_WEIGHT: [i32; CORR_KINDS] = [203, 109, 109, 121, 72];
 const CORR_DIVISOR: i32 = 2048;
 
 /// How many separate readings of "what kind of position is this" the
 /// correction is spread over.
 ///
-/// One key was pawn structure alone, which is the classic and the weakest: two
-/// positions with the same pawns and completely different pieces share an
-/// entry and teach each other nothing useful. Five keys, each answering a
-/// narrower question, means a correction learned about a rook ending is filed
-/// where a rook ending will find it.
+/// Five, and which five matters more than how many. Two of the first set were
+/// a rook-and-queen key and a knight-and-bishop key, and both were dropped:
+/// each is a strict subset of the non-pawn key, so they answered a question
+/// already answered and were only adding their own collisions to it. The
+/// non-pawn key took their place twice, once per colour -- how much force each
+/// side has left are different facts and were being merged into one.
+///
+/// The fifth is the last move as a change rather than as a destination: the
+/// difference between the position key before and after it, which carries
+/// where the piece came from, what it took and whose move it was. What it
+/// learns is "a change of this shape tends to be misread", which is not
+/// something the piece-and-square key can express.
 pub const CORR_KINDS: usize = 5;
 
 #[inline]
@@ -98,30 +105,70 @@ fn mix(x: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// The five indices for this position, in order: pawns, everything that is not
-/// a pawn, the majors, the minors, and what was played to get here.
+/// A Zobrist key over one subset of the pieces.
+///
+/// Built from the same per-piece randoms the position key uses, so two boards
+/// share a key only when the chosen pieces stand on the same squares in the
+/// same colours. That is the whole point and it was what the previous version
+/// threw away: it keyed on the occupancy bitboard, which cannot tell a white
+/// queen on d1 from a black knight on d1, and on `both()` bitboards that merged
+/// the colours outright. A table indexed like that files a correction learned
+/// in one position where an unrelated position will read it, and the two teach
+/// each other nothing -- measured, switching it on cost fourteen Elo.
 #[inline]
-fn corr_indices(board: &Board, last: Option<(usize, usize)>) -> [usize; CORR_KINDS] {
-    let p = |c: Color, t: PieceType| board.pieces[c.idx()][t.idx()];
-    let both = |t: PieceType| p(Color::White, t) | p(Color::Black, t);
+fn subset_key(board: &Board, colors: &[Color], types: &[PieceType]) -> u64 {
+    let z = crate::zobrist::tabelas();
+    let mut k = 0u64;
+    for &c in colors {
+        for &t in types {
+            let mut bb = board.pieces[c.idx()][t.idx()];
+            while bb != 0 {
+                let sq = bb.trailing_zeros() as usize;
+                bb &= bb - 1;
+                k ^= z.piece_sq[c.idx()][t.idx()][sq];
+            }
+        }
+    }
+    k
+}
 
-    let pawns = mix(p(Color::White, PieceType::Pawn))
-        ^ mix(p(Color::Black, PieceType::Pawn).wrapping_mul(3));
-    let nonpawn = mix(board.occ_all & !both(PieceType::Pawn));
-    let major = mix(both(PieceType::Rook) ^ both(PieceType::Queen).wrapping_mul(5));
-    let minor = mix(both(PieceType::Knight) ^ both(PieceType::Bishop).wrapping_mul(7));
+/// The five indices for this position: pawns, White's remaining force, Black's
+/// remaining force, the last move by piece and destination, and the last move
+/// as a change of position key.
+#[inline]
+fn corr_indices(
+    board: &Board,
+    last: Option<(usize, usize)>,
+    hash_delta: u64,
+) -> [usize; CORR_KINDS] {
+    use Color::{Black, White};
+    use PieceType::{Bishop, Knight, Pawn, Queen, Rook};
+
+    const BOTH: [Color; 2] = [White, Black];
+    const FORCE: [PieceType; 4] = [Knight, Bishop, Rook, Queen];
+
+    let pawns = subset_key(board, &BOTH, &[Pawn]);
+    let np_white = subset_key(board, &[White], &FORCE);
+    let np_black = subset_key(board, &[Black], &FORCE);
+
     let cont = match last {
         Some((pc, to)) => mix((pc as u64) << 8 | to as u64 | 0x5eed_0000_0000),
         None => 0,
     };
 
+    // Zero when there is no previous position to differ from, which files
+    // everything at the root in one slot rather than in a random one.
+    let trans = if hash_delta == 0 { 0 } else { mix(hash_delta) };
+
+    // The subset keys are XORs of randoms, so mix once more before taking the
+    // low bits as an index.
     let m = (CORR_SIZE - 1) as u64;
     [
-        (pawns & m) as usize,
-        (nonpawn & m) as usize,
-        (major & m) as usize,
-        (minor & m) as usize,
+        (mix(pawns) & m) as usize,
+        (mix(np_white) & m) as usize,
+        (mix(np_black) & m) as usize,
         (cont & m) as usize,
+        (trans & m) as usize,
     ]
 }
 
@@ -448,6 +495,22 @@ impl Params {
 /// smaller, settled set of ideas. What each is worth then has an answer
 /// rather than an opinion: turn exactly one on, play a match, read the number.
 /// A feature that cannot be switched off is a feature nobody ever measured.
+///
+/// Measured at 8+0.08 against this engine with everything off, roughly two
+/// hundred games each, so the interval on any one of them is about seventy Elo
+/// wide and only the extremes below mean anything:
+///
+///   NmpCutNode  +24    RfpDamp  +20    Razoring  +14
+///   Rule50Fade   -4    TtCutCredit -4   CheckExt   -6
+///   CaptureHist  -8    Probcut -12     CorrHist  -14
+///   LmpImproving -24   TtPvLmr -25     QsFutility -130
+///
+/// The last one is the only result that needed no second sample: three wins
+/// against forty-eight losses. It was not the idea, it was a line of it, and
+/// the same turned out to be true of the correction history -- both are
+/// commented where they are implemented. That is the lesson these numbers
+/// actually carry: a technique that is worth Elo in every strong engine and
+/// negative here is a bug report, not a measurement.
 #[derive(Clone, Copy)]
 pub struct Features {
     /// Learn how wrong the static evaluation usually is for a pawn structure,
@@ -870,12 +933,28 @@ impl Searcher {
         self.capthist = vec![[[0; 6]; 64]; 6];
     }
 
+    /// What the last move changed about the position key.
+    ///
+    /// The key stack holds every position back to the start of the game, with
+    /// the current one on top, so the difference between the top two is the
+    /// move that was just made -- from, to, what it took and whose it was, all
+    /// in one number. Zero when there is nothing above.
+    #[inline]
+    fn hash_delta(&self) -> u64 {
+        let n = self.keys.len();
+        if n >= 2 {
+            self.keys[n - 1] ^ self.keys[n - 2]
+        } else {
+            0
+        }
+    }
+
     /// The static score, adjusted by what the search has been saying about
     /// positions with this pawn structure.
     #[inline]
     fn corrected(&self, board: &Board, raw: i32, ply: usize) -> i32 {
         let last = if ply > 0 { self.played[ply - 1] } else { None };
-        let idx = corr_indices(board, last);
+        let idx = corr_indices(board, last, self.hash_delta());
         let side = board.side.idx();
         let mut total = 0i32;
         for k in 0..CORR_KINDS {
@@ -897,7 +976,7 @@ impl Searcher {
     #[inline]
     fn learn_correction(&mut self, board: &Board, diff: i32, depth: i32, ply: usize) {
         let last = if ply > 0 { self.played[ply - 1] } else { None };
-        let idx = corr_indices(board, last);
+        let idx = corr_indices(board, last, self.hash_delta());
         let side = board.side.idx();
         let bonus = (diff * depth / 8).clamp(-CORR_MAX_UPDATE, CORR_MAX_UPDATE);
         for k in 0..CORR_KINDS {
