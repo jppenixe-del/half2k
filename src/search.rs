@@ -540,6 +540,23 @@ pub struct Features {
     pub lmp_improving: bool,
     /// In quiescence, skip a capture that cannot come near alpha even if it
     /// wins everything it takes.
+    ///
+    /// Measured five times and negative every time: minus a hundred and thirty
+    /// as first written, minus sixty-three after four structural fixes, minus
+    /// twenty-eight once the margin was converted into this engine's units.
+    /// Rather than a sixth attempt, a count of what it actually discards.
+    ///
+    /// Of the captures it throws away, 71% in an opening and 62% in a tactical
+    /// position pass the static exchange test. They win material or trade
+    /// level, and the exchange filter running in the same loop would have kept
+    /// every one of them.
+    ///
+    /// That is the whole answer. Quiescence here already prunes by exchange at
+    /// a threshold of zero, so anything losing material is gone before this
+    /// test is reached, and what it is left deciding about are the sound
+    /// captures. A static margin then removes the moves the search exists to
+    /// examine. The technique is not wrong in general; it is wrong on top of a
+    /// filter that has already done its work.
     pub qs_futility: bool,
     /// Spend less when most of the tree went to the move that won anyway.
     pub tm_node_effort: bool,
