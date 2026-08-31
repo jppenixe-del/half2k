@@ -633,6 +633,14 @@ pub struct Searcher {
     /// most of the tree and still came out best was not a close call, and time
     /// management can read that.
     root_effort: Vec<(Move, u64)>,
+    /// Every root move with what this iteration thought of it.
+    ///
+    /// Keeping only the best one leaves nothing to fall back on when the best
+    /// one repeats: there is no second opinion, only a move and no reason to
+    /// prefer anything else. With the whole list scored, a repetition can be
+    /// declined in favour of something that is nearly as good, and how much
+    /// worse we are willing to accept is a number rather than an accident.
+    root_scores: Vec<(Move, i32)>,
     /// Which plies got there by passing. Two passes in a row prove nothing:
     /// the side to move has effectively been given a free tempo twice, and the
     /// position being searched is not one that can occur.
@@ -763,6 +771,7 @@ impl Searcher {
             ref_hist: crate::refsearch::Histories::new(MAX_PLY),
             pre_moves: [None; PRE_MOVES],
             root_effort: Vec::with_capacity(256),
+            root_scores: Vec::with_capacity(256),
             null_at: [false; MAX_PLY],
         }
     }
@@ -1016,6 +1025,16 @@ impl Searcher {
         self.stopped
     }
 
+    /// Would playing this move land straight back on a position already seen?
+    #[inline]
+    fn repeats_at_once(&self, board: &Board, mv: Move) -> bool {
+        let mut b = board.clone();
+        let undo = b.make_move(&mv);
+        let h = b.hash;
+        b.unmake_move(&mv, &undo);
+        self.keys.iter().rev().take(64).any(|k| *k == h)
+    }
+
     /// Has this position already occurred? One earlier occurrence is enough to
     /// treat it as drawn inside the search -- waiting for the third makes the
     /// search miss the repetition it is about to walk into.
@@ -1069,6 +1088,7 @@ impl Searcher {
         for depth in 1..=max_depth {
             let iter_start = self.start.elapsed();
             self.root_effort.clear();
+            self.root_scores.clear();
             let score = self.aspiration(board, depth as i32, best_score);
 
             // An aborted iteration has searched only part of the move list, so
@@ -1081,6 +1101,31 @@ impl Searcher {
             best_score = score;
             if self.pv_len[0] > 0 {
                 best = self.pv[0][0];
+            }
+
+            // Decline a repetition when something else is nearly as good.
+            //
+            // Contempt already makes a repeated position score badly INSIDE
+            // the search, but only where the search reaches one. A move that
+            // repeats immediately -- straight back into a position already on
+            // the board twice -- is decided here, where the whole root list is
+            // in hand and the alternatives have scores.
+            if self.params.contempt > 0 {
+                if let Some(b) = best {
+                    if self.repeats_at_once(board, b) {
+                        let margin = self.params.contempt;
+                        let alt = self
+                            .root_scores
+                            .iter()
+                            .filter(|(m, _)| *m != b && !self.repeats_at_once(board, *m))
+                            .max_by_key(|(_, sc)| *sc);
+                        if let Some((m, sc)) = alt {
+                            if *sc >= best_score - margin {
+                                best = Some(*m);
+                            }
+                        }
+                    }
+                }
             }
 
             if info {
@@ -1840,6 +1885,11 @@ impl Searcher {
 
             if root {
                 self.root_effort.push((mv, self.nodes - nodes_before));
+                // A move searched with a null window that failed low has no
+                // real score, only a bound. Recorded anyway: it is still
+                // evidence of the ordering, and the fallback below only ever
+                // looks at moves close to the best, which fail-lows are not.
+                self.root_scores.push((mv, score));
             }
 
             // A quiet move that was reduced and then had to be searched again
