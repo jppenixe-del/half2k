@@ -5,7 +5,7 @@
 //! magic numbers are found here via random search at startup rather than
 //! hardcoded, so there's nothing to transcribe/verify against an
 //! external source -- the search is self-verifying (every candidate is
-//! checked against the reference ray-cast implementation for every
+//! checked against a straightforward ray-cast implementation for every
 //! occupancy subset before being accepted).
 use crate::bitboard::*;
 use crate::types::Square;

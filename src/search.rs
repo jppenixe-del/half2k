@@ -219,7 +219,7 @@ fn time_scale(effort_frac: f64, settle: u32, score_drop: i32, changes: u32) -> f
 /// How far above the root the continuation tables may reach into the game.
 pub const PRE_MOVES: usize = 6;
 
-/// Floor of the base two logarithm, which is what the reference's reduction
+/// Floor of the base two logarithm, which is what the alternative reduction
 /// formula is built on.
 #[inline]
 fn ilog2i(v: i32) -> i32 {
@@ -262,7 +262,7 @@ pub struct Params {
     pub fut_depth: i32,
     /// Divisor applied to the history score inside the forward futility
     /// margin. In OUR history units, which run about five and a half times
-    /// smaller than the reference this value came from.
+    /// smaller than the scale this value was originally written for.
     pub fut_hist_div: i32,
     pub hist_prune: i32,
     /// Static exchange threshold for quiet moves, as `-x * (d + d*d)`.
@@ -442,11 +442,10 @@ impl Params {
     }
 }
 
-/// The techniques that the program this network was trained against does not
-/// have.
+/// Techniques that are switched off until they have earned their place.
 ///
 /// Every one is off by default, so the engine out of the box searches with the
-/// same set of ideas as that reference. What each is worth then has an answer
+/// smaller, settled set of ideas. What each is worth then has an answer
 /// rather than an opinion: turn exactly one on, play a match, read the number.
 /// A feature that cannot be switched off is a feature nobody ever measured.
 #[derive(Clone, Copy)]
@@ -488,20 +487,20 @@ pub struct Features {
     /// same clock, and the search swapped whole. Whichever way it comes out
     /// says where the difference lives.
     pub ref_search: bool,
-    /// Use the reference's reduction formula instead of this engine's table.
+    /// Use the integer-logarithm reduction formula instead of the table.
     ///
     /// The last place where a number in this search is an invention rather
     /// than something measured. Everything else came across with its value;
     /// the reduction shape did not, because it was written before the
     /// reference was read closely, and it is the highest-leverage part of a
     /// search to be guessing at.
-    pub pawn_lmr: bool,
+    pub log_lmr: bool,
 
     /// Reduce harder at a node that is expected to fail high.
     ///
-    /// Unlike the rest, this is ON by default. The reference this network was
-    /// trained against has it, so it belongs in the baseline rather than on top
-    /// of it -- the switch is here to measure it, not to leave it out.
+    /// Unlike the rest, this is ON by default: it belongs in the baseline
+    /// rather than on top of it, and the switch is here to measure it, not to
+    /// leave it out.
     pub cut_node_lmr: bool,
 
     /// Skip a quiet move the history has consistently disliked.
@@ -532,7 +531,7 @@ impl Default for Features {
             tt_cut_credit: false,
             capture_hist: false,
             ref_search: false,
-            pawn_lmr: false,
+            log_lmr: false,
             cut_node_lmr: true,
             history_prune: true,
             tm_stability: true,
@@ -560,7 +559,7 @@ impl Features {
             "ttcutcredit" => self.tt_cut_credit = on,
             "capturehist" => self.capture_hist = on,
             "refsearch" => self.ref_search = on,
-            "pawnlmr" => self.pawn_lmr = on,
+            "loglmr" => self.log_lmr = on,
             "cutnodelmr" => self.cut_node_lmr = on,
             "historyprune" => self.history_prune = on,
             "tmstability" => self.tm_stability = on,
@@ -570,7 +569,7 @@ impl Features {
         true
     }
 
-    /// The ones the reference does not have. All default off.
+    /// The ones outside the settled set. All default off.
     pub const EXTRA: [&'static str; 14] = [
         "CorrHist",
         "Razoring",
@@ -585,7 +584,7 @@ impl Features {
         "TtCutCredit",
         "CaptureHist",
         "RefSearch",
-        "PawnLmr",
+        "LogLmr",
     ];
 
     /// The ones it does have, so they are in the baseline. All default on.
@@ -667,7 +666,7 @@ pub struct Searcher {
     /// tables, which index by a move rather than by a piece and square.
     pub(crate) played_moves: Vec<Option<Move>>,
     /// The transcribed search keeps its own tables: same shapes and ceilings as
-    /// the reference, which are not the shapes ours uses.
+    /// the transcribed search, which are not the shapes the other one uses.
     pub(crate) ref_hist: crate::refsearch::Histories,
     /// The last few moves of the game, for the plies above the root.
     pub(crate) pre_moves: [Option<Move>; PRE_MOVES],
@@ -1584,7 +1583,7 @@ impl Searcher {
             // the position is so good it survives giving away a move, and how
             // good it is answers that better than how deep we are.
             //
-            // The extra conditions are the reference's and they matter: the
+            // The extra conditions matter: the
             // raw static score has to be at least as good as the uncorrected
             // one, and the uncorrected one has to be within reach of beta. A
             // position that only looks good because the table said so is not
@@ -1759,7 +1758,7 @@ impl Searcher {
                     // Futility: even handed the margin, this move does not
                     // reach alpha, and a quiet move does not change the
                     // material to make up the difference.
-                    // The history term is the reference's and belongs here:
+                    // The history term belongs here:
                     // a move the tables like is worth trying even when the
                     // margin says otherwise, and one they dislike is worth
                     // less than the margin suggests. Its divisor is in OUR
@@ -1782,7 +1781,7 @@ impl Searcher {
                     // depth so that it only bites where being wrong is cheap.
                     //
                     // The constant is in OUR history units and had to be. Taken
-                    // straight from a reference whose tables run to about
+                    // straight from a design whose tables run to about
                     // 105000, against ours that cap near 24500, it never once
                     // fired -- the two runs came back with byte-identical node
                     // counts, which is what a dead branch looks like from
@@ -1865,8 +1864,8 @@ impl Searcher {
 
                 did_lmr = true;
                 let mut r = 0;
-                if self.features.pawn_lmr {
-                    // The reference's shape, whole. Integer logarithms of the
+                if self.features.log_lmr {
+                    // The other shape, whole. Integer logarithms of the
                     // move number and the depth, a ply back for anything
                     // tactical or on the principal variation, the history
                     // divided by the ceiling one table reaches, two plies at a

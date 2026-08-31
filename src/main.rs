@@ -16,6 +16,7 @@ mod magic;
 mod movegen;
 mod moves;
 mod nnue;
+mod ordered_movegen;
 mod perft;
 mod refsearch;
 mod search;
@@ -162,6 +163,24 @@ fn main() {
                 }
                 let board = Board::from_fen(fen);
                 println!("{}", eval_white(net, &board));
+            }
+        }
+        // `genverify [depth]` -- the ordered generator against the old one.
+        Some("genverify") => {
+            let depth: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(4);
+            let atk = Attacks::new();
+            let mut bad = 0u64;
+            for (fen, _) in PERFT_SUITE {
+                let mut board = Board::from_fen(fen);
+                let (n, w) = perft::verify_generator(&mut board, depth, &atk);
+                bad += w;
+                println!("  {:>10} nodes  {:>4} wrong  {}", n, w, fen);
+            }
+            if bad == 0 {
+                println!("\nthe two generators produce the same moves everywhere");
+            } else {
+                println!("\n{} disagreements", bad);
+                std::process::exit(1);
             }
         }
         // `verify <network> [depth]` -- walk the same positions perft does, and

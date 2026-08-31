@@ -253,7 +253,7 @@ impl Accumulator {
     }
 
     /// Build both perspectives from nothing. Correct always, and slow enough
-    /// that it is only used to start a position and as the reference the
+    /// that it is only used to start a position and as the yardstick the
     /// incremental path is checked against.
     pub fn fresh(net: &Network, pieces: &[[Bitboard; 6]; 2], kings: [Square; 2]) -> Self {
         Accumulator {

@@ -64,3 +64,38 @@ pub fn verify_accumulator(board: &mut Board, depth: u32, atk: &Attacks) -> (u64,
     }
     (nodes, wrong)
 }
+
+/// Walk a tree and check that the ordered generator agrees with the one the
+/// engine has always used -- same moves, however they are arranged.
+///
+/// Order is the whole point of the other generator, so order is exactly what
+/// this must not compare. It compares the sets: anything missing is a legal
+/// move the engine would never find, anything extra is a move it would try to
+/// play and could not.
+pub fn verify_generator(board: &mut Board, depth: u32, atk: &Attacks) -> (u64, u64) {
+    let mut wrong = 0u64;
+    let a = generate_legal(board, atk);
+    let b = crate::ordered_movegen::generate(board, atk, crate::ordered_movegen::GEN_LEGAL);
+    let mut sa: Vec<String> = a.iter().map(|m| m.to_uci()).collect();
+    let mut sb: Vec<String> = b.iter().map(|m| m.to_uci()).collect();
+    sa.sort();
+    sb.sort();
+    if sa != sb {
+        wrong += 1;
+        if wrong <= 5 {
+            eprintln!("MISMATCH {}\n  antigo {:?}\n  novo   {:?}", board.to_fen(), sa, sb);
+        }
+    }
+    if depth == 0 {
+        return (1, wrong);
+    }
+    let mut nodes = 1u64;
+    for mv in a {
+        let undo = board.make_move(&mv);
+        let (n, w) = verify_generator(board, depth - 1, atk);
+        nodes += n;
+        wrong += w;
+        board.unmake_move(&mv, &undo);
+    }
+    (nodes, wrong)
+}

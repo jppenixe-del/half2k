@@ -72,15 +72,14 @@ pub fn main_loop() {
                 );
                 println!("option name EvalFile type string default <empty>");
                 // Off by default, every one of them: out of the box the search
-                // uses the same set of ideas as the reference this network was
-                // trained against, so anything switched on has a number of its
-                // own rather than being lost in a pile of simultaneous changes.
+                // uses the smaller, settled set of ideas, so anything switched
+                // on has a number of its own rather than being lost in a pile
+                // of simultaneous changes.
                 for name in crate::search::Features::EXTRA {
                     println!("option name {} type check default false", name);
                 }
-                // These the reference has too, so they are part of the baseline
-                // and start on. The switch is for measuring them, not for
-                // leaving them out.
+                // These are part of the baseline and start on. The switch is
+                // for measuring them, not for leaving them out.
                 for name in crate::search::Features::BASELINE {
                     println!("option name {} type check default true", name);
                 }
@@ -223,6 +222,9 @@ pub fn main_loop() {
                     i += 1;
                 }
                 let best = searcher.go(&mut board, &limits, true);
+                if std::env::var_os("HALF2K_DBG").is_some() {
+                    eprintln!("{}", crate::refsearch::dbg_report());
+                }
                 match best {
                     Some(m) => println!("bestmove {}", m.to_uci()),
                     // Nothing legal: say so rather than go quiet, which reads
