@@ -75,8 +75,14 @@ pub fn main_loop() {
                 // uses the same set of ideas as the reference this network was
                 // trained against, so anything switched on has a number of its
                 // own rather than being lost in a pile of simultaneous changes.
-                for name in crate::search::Features::NAMES {
+                for name in crate::search::Features::EXTRA {
                     println!("option name {} type check default false", name);
+                }
+                // These the reference has too, so they are part of the baseline
+                // and start on. The switch is for measuring them, not for
+                // leaving them out.
+                for name in crate::search::Features::BASELINE {
+                    println!("option name {} type check default true", name);
                 }
                 println!("uciok");
             }

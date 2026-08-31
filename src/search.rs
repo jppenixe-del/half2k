@@ -97,6 +97,13 @@ pub struct Features {
     pub iir: bool,
     /// Cut the late move count in half when things are not improving.
     pub lmp_improving: bool,
+
+    /// Reduce harder at a node that is expected to fail high.
+    ///
+    /// Unlike the rest, this is ON by default. The reference this network was
+    /// trained against has it, so it belongs in the baseline rather than on top
+    /// of it -- the switch is here to measure it, not to leave it out.
+    pub cut_node_lmr: bool,
 }
 
 impl Default for Features {
@@ -108,6 +115,7 @@ impl Default for Features {
             ttpv_lmr: false,
             iir: false,
             lmp_improving: false,
+            cut_node_lmr: true,
         }
     }
 }
@@ -122,12 +130,14 @@ impl Features {
             "ttpvlmr" => self.ttpv_lmr = on,
             "iir" => self.iir = on,
             "lmpimproving" => self.lmp_improving = on,
+            "cutnodelmr" => self.cut_node_lmr = on,
             _ => return false,
         }
         true
     }
 
-    pub const NAMES: [&'static str; 6] = [
+    /// The ones the reference does not have. All default off.
+    pub const EXTRA: [&'static str; 6] = [
         "CorrHist",
         "Razoring",
         "Rule50Fade",
@@ -135,6 +145,9 @@ impl Features {
         "IIR",
         "LmpImproving",
     ];
+
+    /// The ones it does have, so they are in the baseline. All default on.
+    pub const BASELINE: [&'static str; 1] = ["CutNodeLmr"];
 }
 
 #[derive(Default, Clone)]
@@ -560,7 +573,7 @@ impl Searcher {
         };
 
         loop {
-            let score = self.negamax(board, depth, alpha, beta, 0, true);
+            let score = self.negamax(board, depth, alpha, beta, 0, true, false);
             if self.stopped {
                 return score;
             }
@@ -579,6 +592,16 @@ impl Searcher {
         }
     }
 
+    /// `cut_node` says this node is expected to fail high.
+    ///
+    /// It is not a guess made here: it is handed down. The first child of a
+    /// principal variation node is another one; every later child of a
+    /// principal variation node is expected to fail high; the children of a
+    /// node expected to fail high are expected to fail low, and the other way
+    /// round. Knowing which kind of node you are in is worth something, because
+    /// a node that is expected to fail high will do it on one of the first
+    /// moves or not at all, so the late ones there can be reduced harder than
+    /// the same moves somewhere else.
     fn negamax(
         &mut self,
         board: &mut Board,
@@ -587,6 +610,7 @@ impl Searcher {
         beta: i32,
         ply: usize,
         pv_node: bool,
+        cut_node: bool,
     ) -> i32 {
         self.pv_len[ply] = 0;
 
@@ -711,7 +735,10 @@ impl Searcher {
                 let undo = board.make_null_move();
                 self.keys.push(board.hash);
                 self.null_at[ply] = true;
-                let score = -self.negamax(board, depth - r, -beta, -beta + 1, ply + 1, false);
+                // Passing the position over expects the opposite of whatever
+                // this node expects.
+                let score =
+                    -self.negamax(board, depth - r, -beta, -beta + 1, ply + 1, false, !cut_node);
                 self.null_at[ply] = false;
                 self.keys.pop();
                 board.unmake_null_move(&undo);
@@ -780,6 +807,7 @@ impl Searcher {
                             target,
                             ply,
                             false,
+                            cut_node,
                         );
                         self.excluded[ply] = None;
                         if self.stopped {
@@ -841,7 +869,11 @@ impl Searcher {
 
             let mut score;
             if i == 0 {
-                score = -self.negamax(board, new_depth, -beta, -alpha, ply + 1, pv_node);
+                // The first move of a principal variation node leads to another
+                // one; anywhere else the child expects the opposite of us.
+                let child_cut = if pv_node { false } else { !cut_node };
+                score =
+                    -self.negamax(board, new_depth, -beta, -alpha, ply + 1, pv_node, child_cut);
             } else {
                 // Late move reductions: the ordering has already put the moves
                 // most likely to be best first, so the ones at the back are
@@ -860,14 +892,31 @@ impl Searcher {
                     // A move the history likes gets the benefit of the doubt,
                     // one it dislikes gets less of it.
                     r -= (scores[i] / 4096).clamp(-2, 2);
+                    // A node expected to fail high does it early or not at all,
+                    // so its late moves are worth less than late moves
+                    // elsewhere and can be cut deeper.
+                    if self.features.cut_node_lmr && cut_node {
+                        r += 2;
+                    }
                     r = r.clamp(0, (new_depth - 1).max(0));
                 }
-                score = -self.negamax(board, new_depth - r, -alpha - 1, -alpha, ply + 1, false);
+                // A reduced scout search is looking for a reason to stop, so
+                // the child is treated as expecting to fail high.
+                score =
+                    -self.negamax(board, new_depth - r, -alpha - 1, -alpha, ply + 1, false, true);
                 if score > alpha && r > 0 {
-                    score = -self.negamax(board, new_depth, -alpha - 1, -alpha, ply + 1, false);
+                    score = -self.negamax(
+                        board,
+                        new_depth,
+                        -alpha - 1,
+                        -alpha,
+                        ply + 1,
+                        false,
+                        !cut_node,
+                    );
                 }
                 if score > alpha && score < beta {
-                    score = -self.negamax(board, new_depth, -beta, -alpha, ply + 1, pv_node);
+                    score = -self.negamax(board, new_depth, -beta, -alpha, ply + 1, true, false);
                 }
             }
 
