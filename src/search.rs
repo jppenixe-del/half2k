@@ -2185,8 +2185,16 @@ impl Searcher {
                     .promotion
                     .map(|p| value_in_eval_units(p) - value_in_eval_units(PieceType::Pawn))
                     .unwrap_or(0);
-                if stand != TT_EVAL_NONE as i32
-                    && stand + taken + promo + 200 <= alpha
+                // Measured against the static score, not against the floor
+                // the table raised or lowered. What this test knows how to
+                // correct is a piece value, and a piece value only means
+                // something added to a static evaluation of the same position.
+                // A stored upper bound below the static score makes the floor
+                // pessimistic, and pruning a capture against a pessimistic
+                // floor throws away captures that were good: measured, the
+                // difference was three wins against thirty-four losses.
+                if static_eval != TT_EVAL_NONE as i32
+                    && static_eval + taken + promo + 200 <= alpha
                 {
                     continue;
                 }
