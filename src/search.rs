@@ -58,8 +58,27 @@ fn build_lmr_table(base: i32, div: i32) -> [[i32; 64]; 64] {
 /// key. Derived from the state, it cannot drift out of sync with it, and a
 /// heuristic table tolerates collisions by construction.
 const CORR_SIZE: usize = 16384;
-const CORR_GRAIN: i32 = 256;
-const CORR_MAX: i32 = 32 * CORR_GRAIN;
+
+/// Where one table's entry saturates.
+///
+/// It was 8192 with a grain of 256, which meant the whole correction, summed
+/// over every table, could reach thirty two units -- sixteen centipawns. The
+/// reverse futility margin is a hundred and fifty per ply. A correction that
+/// small cannot move a pruning decision, which is the only thing it exists to
+/// do, and measuring it found exactly the nothing that implies.
+const CORR_MAX: i32 = 1024;
+
+/// The most one update may move an entry.
+const CORR_MAX_UPDATE: i32 = CORR_MAX / 4;
+
+/// How much each reading is trusted, out of the divisor below.
+///
+/// Not an average. The tables answer different questions and are not equally
+/// good at it -- pawn structure says the most, the pieces that are left say
+/// less, and what was just played says something else again. Taken from a
+/// reference where these were tuned over games rather than chosen.
+const CORR_WEIGHT: [i32; CORR_KINDS] = [196, 176, 101, 168, 150];
+const CORR_DIVISOR: i32 = 2048;
 
 /// How many separate readings of "what kind of position is this" the
 /// correction is spread over.
@@ -134,6 +153,21 @@ const HIST_MAX_CONT: i32 = 30000;
 fn hist_bonus(depth: i32) -> i32 {
     (200 * depth).min(4000)
 }
+
+/// What one capture cutoff is worth.
+///
+/// Its own curve, steeper and with an offset, rather than the quiet one. A
+/// capture that works is a stronger statement than a quiet move that works --
+/// there were fewer of them to choose from and the material says whether it
+/// paid -- so the table should move further on it. Reusing the quiet bonus made
+/// this three times too small at the depths where it matters.
+#[inline]
+fn capt_bonus(depth: i32) -> i32 {
+    (depth * 680 - 250).clamp(0, 2400)
+}
+
+/// Where a capture history entry settles.
+const HIST_MAX_CAPT: i32 = 16384;
 
 /// Move towards the ceiling by an amount that shrinks as it is approached, so
 /// an entry saturates instead of running away.
@@ -218,6 +252,7 @@ pub struct Params {
     pub rfp_improving: i32,
     pub rfp_depth: i32,
     pub razor_margin: i32,
+    pub razor_depth: i32,
     pub nmp_base: i32,
     pub nmp_div: i32,
     pub lmp_base: i32,
@@ -268,6 +303,11 @@ pub struct Params {
     pub lmr_nonpv_f: i32,
     pub lmr_ttpv_f: i32,
     /// A stored lower bound this far above beta already answers the question.
+    ///
+    /// In OUR units. The value it came from belongs to a program whose pawn is
+    /// about 255 where ours is 200, so it is scaled by that ratio -- the third
+    /// time today a constant has been carried across a scale boundary, and the
+    /// first two both silently disabled the thing they were meant to control.
     pub probcut_margin: i32,
     pub tm_mtg: i32,
     /// percent of the increment spent each move
@@ -297,7 +337,8 @@ impl Default for Params {
             rfp_margin: 150,
             rfp_improving: 150,
             rfp_depth: 9,
-            razor_margin: 300,
+            razor_margin: 348,
+            razor_depth: 5,
             nmp_base: 4,
             nmp_div: 6,
             lmp_base: 3,
@@ -323,7 +364,7 @@ impl Default for Params {
             lmr_cut_f: 2048,
             lmr_nonpv_f: 1024,
             lmr_ttpv_f: 1024,
-            probcut_margin: 375,
+            probcut_margin: 294,
             tm_mtg: 46,
             tm_inc_pct: 75,
             tm_hard_mult: 4,
@@ -348,6 +389,7 @@ pub const PARAM_SPECS: &[ParamSpec] = &[
     ("RfpImproving", |p| p.rfp_improving, |p, v| p.rfp_improving = v, 0, 300),
     ("RfpDepth", |p| p.rfp_depth, |p, v| p.rfp_depth = v, 2, 12),
     ("RazorMargin", |p| p.razor_margin, |p, v| p.razor_margin = v, 50, 900),
+    ("RazorDepth", |p| p.razor_depth, |p, v| p.razor_depth = v, 1, 10),
     ("NmpBase", |p| p.nmp_base, |p, v| p.nmp_base = v, 2, 8),
     ("NmpDiv", |p| p.nmp_div, |p, v| p.nmp_div = v, 2, 12),
     ("LmpBase", |p| p.lmp_base, |p, v| p.lmp_base = v, 1, 10),
@@ -836,29 +878,33 @@ impl Searcher {
         let last = if ply > 0 { self.played[ply - 1] } else { None };
         let idx = corr_indices(board, last);
         let side = board.side.idx();
-        // The average of what each reading has to say, not their sum: five
-        // tables that agree should move the score as far as one, not five
-        // times as far.
         let mut total = 0i32;
         for k in 0..CORR_KINDS {
-            total += self.corr[k][side][idx[k]];
+            total += self.corr[k][side][idx[k]] * CORR_WEIGHT[k];
         }
-        let c = total / (CORR_KINDS as i32 * CORR_GRAIN);
+        let c = total / CORR_DIVISOR;
         (raw + c).clamp(-MATE_IN_MAX + 1, MATE_IN_MAX - 1)
     }
 
     /// Learn from the difference, weighted by how deep the search that found
     /// it went.
+    /// Move each reading towards what the search actually said.
+    ///
+    /// The amount is the miss scaled by how deep the search that found it went,
+    /// capped, and then applied so that an entry approaches its ceiling instead
+    /// of slamming into it. The previous version multiplied the miss by 256
+    /// before capping, so any miss above thirty two units saturated the target
+    /// and every update looked the same size.
     #[inline]
     fn learn_correction(&mut self, board: &Board, diff: i32, depth: i32, ply: usize) {
         let last = if ply > 0 { self.played[ply - 1] } else { None };
         let idx = corr_indices(board, last);
         let side = board.side.idx();
-        let target = (diff * CORR_GRAIN).clamp(-CORR_MAX, CORR_MAX);
-        let w = (depth + 1).min(16);
+        let bonus = (diff * depth / 8).clamp(-CORR_MAX_UPDATE, CORR_MAX_UPDATE);
         for k in 0..CORR_KINDS {
             let e = &mut self.corr[k][side][idx[k]];
-            *e = ((*e * (256 - w) + target * w) / 256).clamp(-CORR_MAX, CORR_MAX);
+            *e += bonus - *e * bonus.abs() / CORR_MAX;
+            *e = (*e).clamp(-CORR_MAX, CORR_MAX);
         }
     }
 
@@ -1511,9 +1557,18 @@ impl Searcher {
             // unlikely to find enough, so ask it directly instead of spending
             // a full width on the answer. If it turns out to be wrong the
             // score comes back above alpha and the node is searched properly.
+            // The plain static score here, not the one the table improved.
+            // Razoring asks whether the position is so far behind that only a
+            // capture sequence could save it; a bound borrowed from a search
+            // has already priced those in, and asking with it is asking a
+            // question that has been answered.
+            //
+            // And not when alpha is already decisive -- a margin has nothing to
+            // say about a position that is being mated.
             if self.features.razoring
-                && depth <= 3
-                && pruning_eval + self.params.razor_margin * depth < alpha
+                && depth <= self.params.razor_depth
+                && alpha.abs() < 2000
+                && static_eval + self.params.razor_margin * depth <= alpha
             {
                 let q = self.quiescence(board, alpha, alpha + 1, ply);
                 if q < alpha {
@@ -1937,13 +1992,13 @@ impl Searcher {
                         if is_quiet {
                             self.on_beta_cutoff(board, mv, ply, depth, &searched_quiets);
                         } else {
-                            self.credit_capture(board, mv, hist_bonus(depth));
+                            self.credit_capture(board, mv, capt_bonus(depth));
                         }
                         // Captures tried and passed over were wrong here
                         // whatever ended the node, quiet or not.
                         for c in &searched_captures {
                             if *c != mv {
-                                self.credit_capture(board, *c, -hist_bonus(depth));
+                                self.credit_capture(board, *c, -capt_bonus(depth));
                             }
                         }
                         break;
@@ -2258,7 +2313,7 @@ impl Searcher {
                 None => return,
             }
         };
-        hist_add(&mut self.capthist[pc][mv.to as usize][victim], bonus, HIST_MAX_CONT);
+        hist_add(&mut self.capthist[pc][mv.to as usize][victim], bonus, HIST_MAX_CAPT);
     }
 
     /// Move one move for and every other move against, by the same amount.
