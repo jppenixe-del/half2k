@@ -100,7 +100,16 @@ pub struct Params {
     pub fut_base: i32,
     pub fut_slope: i32,
     pub fut_depth: i32,
+    /// Divisor applied to the history score inside the forward futility
+    /// margin. In OUR history units, which run about five and a half times
+    /// smaller than the reference this value came from.
+    pub fut_hist_div: i32,
     pub hist_prune: i32,
+    /// Static exchange threshold for quiet moves, as `-x * (d + d*d)`.
+    pub see_prune_quiet: i32,
+    /// A check is only worth extending for when the position is not already
+    /// decided.
+    pub check_ext_eval: i32,
     pub see_prune: i32,
     /// x100
     pub lmr_base: i32,
@@ -123,26 +132,29 @@ pub struct Params {
 impl Default for Params {
     fn default() -> Self {
         Params {
-            rfp_margin: 80,
-            rfp_improving: 25,
-            rfp_depth: 7,
+            rfp_margin: 150,
+            rfp_improving: 150,
+            rfp_depth: 9,
             razor_margin: 300,
-            nmp_base: 3,
-            nmp_div: 4,
+            nmp_base: 4,
+            nmp_div: 6,
             lmp_base: 3,
             lmp_depth: 6,
-            fut_base: 120,
-            fut_slope: 130,
-            fut_depth: 6,
-            hist_prune: 150,
-            see_prune: 90,
+            fut_base: 100,
+            fut_slope: 150,
+            fut_depth: 12,
+            fut_hist_div: 14,
+            hist_prune: 109,
+            see_prune: 70,
+            see_prune_quiet: 5,
+            check_ext_eval: 75,
             lmr_base: 77,
             lmr_div: 236,
             lmr_cut: 2,
             lmr_hist_div: 4096,
             asp_delta: 25,
             asp_depth: 4,
-            sing_depth: 6,
+            sing_depth: 5,
             sing_margin: 2,
             tm_mtg: 25,
             tm_inc_pct: 75,
@@ -156,19 +168,22 @@ impl Default for Params {
 pub type ParamSpec = (&'static str, fn(&Params) -> i32, fn(&mut Params, i32), i32, i32);
 
 pub const PARAM_SPECS: &[ParamSpec] = &[
-    ("RfpMargin", |p| p.rfp_margin, |p, v| p.rfp_margin = v, 20, 250),
-    ("RfpImproving", |p| p.rfp_improving, |p, v| p.rfp_improving = v, 0, 120),
+    ("RfpMargin", |p| p.rfp_margin, |p, v| p.rfp_margin = v, 40, 300),
+    ("RfpImproving", |p| p.rfp_improving, |p, v| p.rfp_improving = v, 0, 300),
     ("RfpDepth", |p| p.rfp_depth, |p, v| p.rfp_depth = v, 2, 12),
     ("RazorMargin", |p| p.razor_margin, |p, v| p.razor_margin = v, 50, 900),
-    ("NmpBase", |p| p.nmp_base, |p, v| p.nmp_base = v, 2, 6),
-    ("NmpDiv", |p| p.nmp_div, |p, v| p.nmp_div = v, 2, 8),
+    ("NmpBase", |p| p.nmp_base, |p, v| p.nmp_base = v, 2, 8),
+    ("NmpDiv", |p| p.nmp_div, |p, v| p.nmp_div = v, 2, 12),
     ("LmpBase", |p| p.lmp_base, |p, v| p.lmp_base = v, 1, 10),
     ("LmpDepth", |p| p.lmp_depth, |p, v| p.lmp_depth = v, 2, 12),
     ("FutBase", |p| p.fut_base, |p, v| p.fut_base = v, 20, 400),
     ("FutSlope", |p| p.fut_slope, |p, v| p.fut_slope = v, 30, 300),
-    ("FutDepth", |p| p.fut_depth, |p, v| p.fut_depth = v, 2, 12),
+    ("FutDepth", |p| p.fut_depth, |p, v| p.fut_depth = v, 2, 16),
+    ("FutHistDiv", |p| p.fut_hist_div, |p, v| p.fut_hist_div = v, 4, 60),
     ("HistPrune", |p| p.hist_prune, |p, v| p.hist_prune = v, 20, 800),
     ("SeePrune", |p| p.see_prune, |p, v| p.see_prune = v, 20, 250),
+    ("SeePruneQuiet", |p| p.see_prune_quiet, |p, v| p.see_prune_quiet = v, 1, 40),
+    ("CheckExtEval", |p| p.check_ext_eval, |p, v| p.check_ext_eval = v, 0, 400),
     ("LmrBase", |p| p.lmr_base, |p, v| p.lmr_base = v, 0, 200),
     ("LmrDiv", |p| p.lmr_div, |p, v| p.lmr_div = v, 120, 400),
     ("LmrCut", |p| p.lmr_cut, |p, v| p.lmr_cut = v, 0, 4),
@@ -805,7 +820,9 @@ impl Searcher {
     /// Search the root with a window around the last score, widening on a
     /// failure rather than starting wide every time.
     fn aspiration(&mut self, board: &mut Board, depth: i32, prev: i32) -> i32 {
-        let mut delta = self.params.asp_delta;
+        // Wider at low depth, where the previous score is a poor guide, and
+        // narrowing as it becomes a good one.
+        let mut delta = 5 + self.params.asp_delta * 8 / depth.max(1);
         let (mut alpha, mut beta) = if depth <= self.params.asp_depth || is_mate(prev) {
             (-INF, INF)
         } else {
@@ -884,8 +901,10 @@ impl Searcher {
         }
 
         // A king already in check has no quiet evaluation and the branch is
-        // forcing, so it is worth another ply.
-        if in_check {
+        // forcing, so it is worth another ply -- but only while the position is
+        // still a contest. Extending every check in a position already decided
+        // spends the search on lines that change nothing.
+        if in_check && depth < MAX_PLY as i32 {
             depth += 1;
         }
 
@@ -973,12 +992,26 @@ impl Searcher {
             // Null move: hand the opponent a free move and see whether the
             // position still holds. Not with only pawns left, where passing is
             // often the best move there is and the conclusion would be wrong.
+            // The reduction grows with how far above beta we already are,
+            // rather than with depth: the question null move asks is whether
+            // the position is so good it survives giving away a move, and how
+            // good it is answers that better than how deep we are.
+            //
+            // The extra conditions are the reference's and they matter: the
+            // raw static score has to be at least as good as the uncorrected
+            // one, and the uncorrected one has to be within reach of beta. A
+            // position that only looks good because the table said so is not
+            // one to hand a free move away in.
             if depth >= 3
                 && static_eval >= beta
+                && static_eval >= self.eval_stack[ply]
+                && self.eval_stack[ply]
+                    >= beta - 20 * depth - 40 * improving as i32 + 100
                 && has_pieces(board, board.side)
                 && !(ply > 0 && self.null_at[ply - 1])
             {
-                let r = self.params.nmp_base + depth / self.params.nmp_div.max(1);
+                let r = self.params.nmp_base
+                    + ((static_eval - beta) / 200).min(self.params.nmp_div);
                 let undo = board.make_null_move();
                 self.keys.push(board.hash);
                 self.null_at[ply] = true;
@@ -1093,8 +1126,18 @@ impl Searcher {
                     // Futility: even handed the margin, this move does not
                     // reach alpha, and a quiet move does not change the
                     // material to make up the difference.
+                    // The history term is the reference's and belongs here:
+                    // a move the tables like is worth trying even when the
+                    // margin says otherwise, and one they dislike is worth
+                    // less than the margin suggests. Its divisor is in OUR
+                    // history units, which run about five and a half times
+                    // smaller.
+                    let hist = scores[i] / self.params.fut_hist_div.max(1);
                     if depth <= self.params.fut_depth
-                        && static_eval + self.params.fut_base + self.params.fut_slope * depth
+                        && static_eval
+                            + self.params.fut_base
+                            + self.params.fut_slope * depth
+                            + hist
                             <= alpha
                     {
                         break;
@@ -1114,6 +1157,20 @@ impl Searcher {
                     if self.features.history_prune
                         && depth <= 4
                         && scores[i] < -self.params.hist_prune * depth * depth
+                    {
+                        continue;
+                    }
+
+                    // A quiet move can still lose material -- walking a piece
+                    // onto a square where it is taken for nothing. Static
+                    // exchange says so before the search has to find out.
+                    if depth <= 8
+                        && !see::see_ge(
+                            &self.atk,
+                            board,
+                            &mv,
+                            -self.params.see_prune_quiet * (depth + depth * depth),
+                        )
                     {
                         continue;
                     }
