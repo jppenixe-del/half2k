@@ -29,17 +29,19 @@ use std::time::{Duration, Instant};
 /// and the first version computed them in integers -- `ln(3)` and `ln(4)` both
 /// truncate to 1, so the reduction was very nearly a constant and the whole
 /// point of reducing later moves harder was lost.
-fn lmr_table() -> &'static [[i32; 64]; 64] {
-    static T: std::sync::OnceLock<[[i32; 64]; 64]> = std::sync::OnceLock::new();
-    T.get_or_init(|| {
-        let mut t = [[0i32; 64]; 64];
-        for d in 1..64usize {
-            for m in 1..64usize {
-                t[d][m] = (0.77 + (d as f64).ln() * (m as f64).ln() / 2.36) as i32;
-            }
+///
+/// Rebuilt when its two numbers change rather than computed per node: four
+/// thousand logarithms is nothing once a move, and real work once a node.
+fn build_lmr_table(base: i32, div: i32) -> [[i32; 64]; 64] {
+    let base = base as f64 / 100.0;
+    let div = (div as f64 / 100.0).max(0.01);
+    let mut t = [[0i32; 64]; 64];
+    for d in 1..64usize {
+        for m in 1..64usize {
+            t[d][m] = (base + (d as f64).ln() * (m as f64).ln() / div) as i32;
         }
-        t
-    })
+    }
+    t
 }
 
 /// Correction history: how wrong the static evaluation usually is here.
@@ -74,6 +76,124 @@ pub const INF: i32 = 32_000;
 pub const MATE: i32 = 31_000;
 /// Anything at least this large is a mate score, not an evaluation.
 pub const MATE_IN_MAX: i32 = MATE - MAX_PLY as i32;
+
+
+/// Every number the search compares something against.
+///
+/// They are options rather than constants because not one of them was measured
+/// -- each was picked to be sane and then left alone, which is a different
+/// thing from being right. Exposed, they can be walked over by a tuner playing
+/// games, which is the only process that has ever produced good ones.
+///
+/// Two are stored multiplied by a hundred, because the shape they belong to is
+/// a logarithm and the option protocol only carries integers.
+#[derive(Clone, Copy)]
+pub struct Params {
+    pub rfp_margin: i32,
+    pub rfp_improving: i32,
+    pub rfp_depth: i32,
+    pub razor_margin: i32,
+    pub nmp_base: i32,
+    pub nmp_div: i32,
+    pub lmp_base: i32,
+    pub lmp_depth: i32,
+    pub fut_base: i32,
+    pub fut_slope: i32,
+    pub fut_depth: i32,
+    pub hist_prune: i32,
+    pub see_prune: i32,
+    /// x100
+    pub lmr_base: i32,
+    /// x100
+    pub lmr_div: i32,
+    pub lmr_cut: i32,
+    pub lmr_hist_div: i32,
+    pub asp_delta: i32,
+    pub asp_depth: i32,
+    pub sing_depth: i32,
+    pub sing_margin: i32,
+    pub tm_mtg: i32,
+    /// percent of the increment spent each move
+    pub tm_inc_pct: i32,
+    pub tm_hard_mult: i32,
+    /// percent of what is left that the wall may reach
+    pub tm_hard_pct: i32,
+}
+
+impl Default for Params {
+    fn default() -> Self {
+        Params {
+            rfp_margin: 80,
+            rfp_improving: 25,
+            rfp_depth: 7,
+            razor_margin: 300,
+            nmp_base: 3,
+            nmp_div: 4,
+            lmp_base: 3,
+            lmp_depth: 6,
+            fut_base: 120,
+            fut_slope: 130,
+            fut_depth: 6,
+            hist_prune: 150,
+            see_prune: 90,
+            lmr_base: 77,
+            lmr_div: 236,
+            lmr_cut: 2,
+            lmr_hist_div: 4096,
+            asp_delta: 25,
+            asp_depth: 4,
+            sing_depth: 6,
+            sing_margin: 2,
+            tm_mtg: 25,
+            tm_inc_pct: 75,
+            tm_hard_mult: 2,
+            tm_hard_pct: 40,
+        }
+    }
+}
+
+/// Name, current value, and the range a tuner may walk it over.
+pub type ParamSpec = (&'static str, fn(&Params) -> i32, fn(&mut Params, i32), i32, i32);
+
+pub const PARAM_SPECS: &[ParamSpec] = &[
+    ("RfpMargin", |p| p.rfp_margin, |p, v| p.rfp_margin = v, 20, 250),
+    ("RfpImproving", |p| p.rfp_improving, |p, v| p.rfp_improving = v, 0, 120),
+    ("RfpDepth", |p| p.rfp_depth, |p, v| p.rfp_depth = v, 2, 12),
+    ("RazorMargin", |p| p.razor_margin, |p, v| p.razor_margin = v, 50, 900),
+    ("NmpBase", |p| p.nmp_base, |p, v| p.nmp_base = v, 2, 6),
+    ("NmpDiv", |p| p.nmp_div, |p, v| p.nmp_div = v, 2, 8),
+    ("LmpBase", |p| p.lmp_base, |p, v| p.lmp_base = v, 1, 10),
+    ("LmpDepth", |p| p.lmp_depth, |p, v| p.lmp_depth = v, 2, 12),
+    ("FutBase", |p| p.fut_base, |p, v| p.fut_base = v, 20, 400),
+    ("FutSlope", |p| p.fut_slope, |p, v| p.fut_slope = v, 30, 300),
+    ("FutDepth", |p| p.fut_depth, |p, v| p.fut_depth = v, 2, 12),
+    ("HistPrune", |p| p.hist_prune, |p, v| p.hist_prune = v, 20, 800),
+    ("SeePrune", |p| p.see_prune, |p, v| p.see_prune = v, 20, 250),
+    ("LmrBase", |p| p.lmr_base, |p, v| p.lmr_base = v, 0, 200),
+    ("LmrDiv", |p| p.lmr_div, |p, v| p.lmr_div = v, 120, 400),
+    ("LmrCut", |p| p.lmr_cut, |p, v| p.lmr_cut = v, 0, 4),
+    ("LmrHistDiv", |p| p.lmr_hist_div, |p, v| p.lmr_hist_div = v, 512, 16384),
+    ("AspDelta", |p| p.asp_delta, |p, v| p.asp_delta = v, 8, 80),
+    ("AspDepth", |p| p.asp_depth, |p, v| p.asp_depth = v, 2, 10),
+    ("SingDepth", |p| p.sing_depth, |p, v| p.sing_depth = v, 4, 12),
+    ("SingMargin", |p| p.sing_margin, |p, v| p.sing_margin = v, 1, 8),
+    ("TmMtg", |p| p.tm_mtg, |p, v| p.tm_mtg = v, 10, 40),
+    ("TmIncPct", |p| p.tm_inc_pct, |p, v| p.tm_inc_pct = v, 20, 95),
+    ("TmHardMult", |p| p.tm_hard_mult, |p, v| p.tm_hard_mult = v, 1, 6),
+    ("TmHardPct", |p| p.tm_hard_pct, |p, v| p.tm_hard_pct = v, 15, 70),
+];
+
+impl Params {
+    pub fn set(&mut self, name: &str, value: i32) -> bool {
+        for (n, _, put, lo, hi) in PARAM_SPECS {
+            if n.eq_ignore_ascii_case(name) {
+                put(self, value.clamp(*lo, *hi));
+                return true;
+            }
+        }
+        false
+    }
+}
 
 /// The techniques that the program this network was trained against does not
 /// have.
@@ -203,6 +323,8 @@ pub struct Searcher {
     /// too large loses a little strength, too small loses whole games.
     pub move_overhead: u64,
     pub features: Features,
+    pub params: Params,
+    lmr: [[i32; 64]; 64],
 
     nodes: u64,
     start: Instant,
@@ -342,6 +464,8 @@ impl Searcher {
             stop,
             move_overhead: 30,
             features: Features::default(),
+            params: Params::default(),
+            lmr: build_lmr_table(Params::default().lmr_base, Params::default().lmr_div),
             nodes: 0,
             start: Instant::now(),
             soft: Duration::from_secs(0),
@@ -361,6 +485,12 @@ impl Searcher {
             root_effort: Vec::with_capacity(256),
             null_at: [false; MAX_PLY],
         }
+    }
+
+    /// Call after changing any parameter, so anything derived from one is
+    /// rebuilt rather than left describing the old value.
+    pub fn params_changed(&mut self) {
+        self.lmr = build_lmr_table(self.params.lmr_base, self.params.lmr_div);
     }
 
     pub fn set_game_history(&mut self, keys: Vec<u64>) {
@@ -457,19 +587,20 @@ impl Searcher {
         // Without one, twenty-five is a deliberately pessimistic guess: games
         // that end sooner leave time unspent, which costs a little strength,
         // while games that run longer flag, which costs the whole point.
-        let mtg = limits.movestogo.unwrap_or(25).max(1);
+        let mtg = limits.movestogo.unwrap_or(self.params.tm_mtg as u64).max(1);
 
         // The increment is income, so most of it can be spent every move
         // without the clock moving. Not all of it: the part held back is what
         // slowly rebuilds a buffer over a long game.
-        let base = usable / mtg + inc * 3 / 4;
+        let base = usable / mtg + inc * self.params.tm_inc_pct as u64 / 100;
 
         // Two ceilings on the wall, and the second is the one that matters.
         //
         // Twice the plan lets a critical move think a little longer. Two
         // fifths of what is left stops that from becoming a way to spend the
         // clock.
-        let hard = (base * 2).min(usable * 2 / 5);
+        let hard = (base * self.params.tm_hard_mult as u64)
+            .min(usable * self.params.tm_hard_pct as u64 / 100);
         let soft = base.min(hard);
 
         self.soft = Duration::from_millis(soft.max(1));
@@ -674,8 +805,8 @@ impl Searcher {
     /// Search the root with a window around the last score, widening on a
     /// failure rather than starting wide every time.
     fn aspiration(&mut self, board: &mut Board, depth: i32, prev: i32) -> i32 {
-        let mut delta = 25;
-        let (mut alpha, mut beta) = if depth <= 4 || is_mate(prev) {
+        let mut delta = self.params.asp_delta;
+        let (mut alpha, mut beta) = if depth <= self.params.asp_depth || is_mate(prev) {
             (-INF, INF)
         } else {
             (prev - delta, prev + delta)
@@ -816,8 +947,12 @@ impl Searcher {
             // the remaining depth. A ply that is improving can afford a
             // narrower margin, since the trend is evidence in the same
             // direction as the score.
-            let margin = 80 * depth - 25 * improving as i32;
-            if depth < 7 && static_eval - margin >= beta && static_eval.abs() < MATE_IN_MAX {
+            let margin = self.params.rfp_margin * depth
+                - self.params.rfp_improving * improving as i32;
+            if depth < self.params.rfp_depth
+                && static_eval - margin >= beta
+                && static_eval.abs() < MATE_IN_MAX
+            {
                 return static_eval;
             }
 
@@ -825,7 +960,10 @@ impl Searcher {
             // unlikely to find enough, so ask it directly instead of spending
             // a full width on the answer. If it turns out to be wrong the
             // score comes back above alpha and the node is searched properly.
-            if self.features.razoring && depth <= 3 && static_eval + 300 * depth < alpha {
+            if self.features.razoring
+                && depth <= 3
+                && static_eval + self.params.razor_margin * depth < alpha
+            {
                 let q = self.quiescence(board, alpha, alpha + 1, ply);
                 if q < alpha {
                     return q;
@@ -840,7 +978,7 @@ impl Searcher {
                 && has_pieces(board, board.side)
                 && !(ply > 0 && self.null_at[ply - 1])
             {
-                let r = 3 + depth / 4;
+                let r = self.params.nmp_base + depth / self.params.nmp_div.max(1);
                 let undo = board.make_null_move();
                 self.keys.push(board.hash);
                 self.null_at[ply] = true;
@@ -898,7 +1036,7 @@ impl Searcher {
             if !root
                 && excluded.is_none()
                 && Some(mv) == tt_move
-                && depth >= 6
+                && depth >= self.params.sing_depth
                 && ply < MAX_PLY - 8
             {
                 if let Some(ts) = tt_score_for_singular {
@@ -907,7 +1045,7 @@ impl Searcher {
                         && matches!(e.bound, Bound::Lower | Bound::Exact)
                         && !is_mate(ts)
                     {
-                        let target = ts - 2 * depth;
+                        let target = ts - self.params.sing_margin * depth;
                         self.excluded[ply] = Some(mv);
                         let s = self.negamax(
                             board,
@@ -942,19 +1080,23 @@ impl Searcher {
                     // Late move pruning: past a certain count at low depth,
                     // the ordering has been wrong often enough that the rest
                     // are not worth the nodes.
+                    let full = self.params.lmp_base + depth * depth;
                     let count = if !self.features.lmp_improving || improving {
-                        3 + depth * depth
+                        full
                     } else {
-                        (3 + depth * depth) / 2
+                        full / 2
                     };
-                    if depth <= 6 && i >= count as usize {
+                    if depth <= self.params.lmp_depth && i >= count as usize {
                         break;
                     }
 
                     // Futility: even handed the margin, this move does not
                     // reach alpha, and a quiet move does not change the
                     // material to make up the difference.
-                    if depth <= 6 && static_eval + 120 + 130 * depth <= alpha {
+                    if depth <= self.params.fut_depth
+                        && static_eval + self.params.fut_base + self.params.fut_slope * depth
+                            <= alpha
+                    {
                         break;
                     }
 
@@ -971,11 +1113,13 @@ impl Searcher {
                     // outside.
                     if self.features.history_prune
                         && depth <= 4
-                        && scores[i] < -150 * depth * depth
+                        && scores[i] < -self.params.hist_prune * depth * depth
                     {
                         continue;
                     }
-                } else if depth <= 8 && !see::see_ge(&self.atk, board, &mv, -90 * depth) {
+                } else if depth <= 8
+                    && !see::see_ge(&self.atk, board, &mv, -self.params.see_prune * depth)
+                {
                     // A capture that loses more than the depth could plausibly
                     // win back.
                     continue;
@@ -1017,7 +1161,7 @@ impl Searcher {
 
                 let mut r = 0;
                 if depth >= 3 && reducible && !in_check {
-                    r = lmr_table()[(depth as usize).min(63)][i.min(63)];
+                    r = self.lmr[(depth as usize).min(63)][i.min(63)];
                     if !is_quiet {
                         // Half as hard for a capture: it changes the material,
                         // so a mistake about it costs more than a mistake about
@@ -1034,12 +1178,12 @@ impl Searcher {
                     }
                     // A move the history likes gets the benefit of the doubt,
                     // one it dislikes gets less of it.
-                    r -= (scores[i] / 4096).clamp(-2, 2);
+                    r -= (scores[i] / self.params.lmr_hist_div.max(1)).clamp(-2, 2);
                     // A node expected to fail high does it early or not at all,
                     // so its late moves are worth less than late moves
                     // elsewhere and can be cut deeper.
                     if self.features.cut_node_lmr && cut_node {
-                        r += 2;
+                        r += self.params.lmr_cut;
                     }
                     r = r.clamp(0, (new_depth - 1).max(0));
                 }

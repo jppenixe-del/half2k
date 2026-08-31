@@ -84,6 +84,18 @@ pub fn main_loop() {
                 for name in crate::search::Features::BASELINE {
                     println!("option name {} type check default true", name);
                 }
+                // Every number the search compares against. Not one was
+                // measured, so every one is a candidate.
+                let d = crate::search::Params::default();
+                for (name, get, _, lo, hi) in crate::search::PARAM_SPECS {
+                    println!(
+                        "option name {} type spin default {} min {} max {}",
+                        name,
+                        get(&d),
+                        lo,
+                        hi
+                    );
+                }
                 println!("uciok");
             }
             "isready" => {
@@ -119,9 +131,12 @@ pub fn main_loop() {
                                 hash_mb = mb.clamp(1, 65536);
                                 let mo = searcher.move_overhead;
                                 let ft = searcher.features;
+                                let pr = searcher.params;
                                 searcher = Searcher::new(hash_mb, stop.clone());
                                 searcher.move_overhead = mo;
                                 searcher.features = ft;
+                                searcher.params = pr;
+                                searcher.params_changed();
                             }
                         }
                         "move overhead" => {
@@ -134,6 +149,12 @@ pub fn main_loop() {
                             net_loaded = false;
                         }
                         other => {
+                            if let Ok(n) = value.parse::<i32>() {
+                                if searcher.params.set(other, n) {
+                                    searcher.params_changed();
+                                    continue;
+                                }
+                            }
                             let on = value.eq_ignore_ascii_case("true");
                             searcher.features.set(other, on);
                         }
