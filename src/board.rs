@@ -348,8 +348,36 @@ impl Board {
         }
 
         // en passant square update
+        // Only record the en passant square when someone can actually take it.
+        //
+        // The square goes into the position key, so recording it after every
+        // double push gives two different keys to two positions that are the
+        // same in every way that matters -- same pieces, same side to move, and
+        // no capture available in either. They then miss each other in the
+        // table, and worse, a repetition between them is not recognised as one,
+        // because a repetition is a comparison of keys.
+        //
+        // A pawn of the other colour standing beside the one that just moved is
+        // the whole of the condition. No attack table needed: the two squares
+        // are the neighbours of the landing square on the same rank, and the
+        // file guard is what stops a pawn on the a-file seeing one on the h.
         self.ep_square = if mv.flag == MoveFlag::DoublePush {
-            if us == Color::White { mv.from + 8 } else { mv.from - 8 }
+            let sq = if us == Color::White { mv.from + 8 } else { mv.from - 8 };
+            let them = us.opp();
+            let their_pawns = self.pieces[them.idx()][PieceType::Pawn.idx()];
+            let f = file_of(mv.to);
+            let mut takers = 0u64;
+            if f > 0 {
+                takers |= 1u64 << (mv.to - 1);
+            }
+            if f < 7 {
+                takers |= 1u64 << (mv.to + 1);
+            }
+            if their_pawns & takers != 0 {
+                sq
+            } else {
+                NO_SQUARE
+            }
         } else {
             NO_SQUARE
         };
