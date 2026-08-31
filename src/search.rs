@@ -185,6 +185,17 @@ fn time_scale(effort_frac: f64, settle: u32, score_drop: i32, changes: u32) -> f
 /// How far above the root the continuation tables may reach into the game.
 pub const PRE_MOVES: usize = 6;
 
+/// Floor of the base two logarithm, which is what the reference's reduction
+/// formula is built on.
+#[inline]
+fn ilog2i(v: i32) -> i32 {
+    if v <= 0 {
+        0
+    } else {
+        31 - (v as u32).leading_zeros() as i32
+    }
+}
+
 pub const MAX_PLY: usize = 128;
 pub const INF: i32 = 32_000;
 pub const MATE: i32 = 31_000;
@@ -421,6 +432,14 @@ pub struct Features {
     /// same clock, and the search swapped whole. Whichever way it comes out
     /// says where the difference lives.
     pub ref_search: bool,
+    /// Use the reference's reduction formula instead of this engine's table.
+    ///
+    /// The last place where a number in this search is an invention rather
+    /// than something measured. Everything else came across with its value;
+    /// the reduction shape did not, because it was written before the
+    /// reference was read closely, and it is the highest-leverage part of a
+    /// search to be guessing at.
+    pub pawn_lmr: bool,
 
     /// Reduce harder at a node that is expected to fail high.
     ///
@@ -457,6 +476,7 @@ impl Default for Features {
             tt_cut_credit: false,
             capture_hist: false,
             ref_search: false,
+            pawn_lmr: false,
             cut_node_lmr: true,
             history_prune: true,
             tm_stability: true,
@@ -484,6 +504,7 @@ impl Features {
             "ttcutcredit" => self.tt_cut_credit = on,
             "capturehist" => self.capture_hist = on,
             "refsearch" => self.ref_search = on,
+            "pawnlmr" => self.pawn_lmr = on,
             "cutnodelmr" => self.cut_node_lmr = on,
             "historyprune" => self.history_prune = on,
             "tmstability" => self.tm_stability = on,
@@ -494,7 +515,7 @@ impl Features {
     }
 
     /// The ones the reference does not have. All default off.
-    pub const EXTRA: [&'static str; 13] = [
+    pub const EXTRA: [&'static str; 14] = [
         "CorrHist",
         "Razoring",
         "Rule50Fade",
@@ -508,6 +529,7 @@ impl Features {
         "TtCutCredit",
         "CaptureHist",
         "RefSearch",
+        "PawnLmr",
     ];
 
     /// The ones it does have, so they are in the baseline. All default on.
@@ -1718,7 +1740,25 @@ impl Searcher {
 
                 did_lmr = true;
                 let mut r = 0;
-                if depth >= 3 && reducible && !in_check {
+                if self.features.pawn_lmr {
+                    // The reference's shape, whole. Integer logarithms of the
+                    // move number and the depth, a ply back for anything
+                    // tactical or on the principal variation, the history
+                    // divided by the ceiling one table reaches, two plies at a
+                    // node expected to fail high, and one always.
+                    //
+                    // Our history tables were rebuilt to its scale earlier, so
+                    // the divisor transfers without conversion.
+                    if depth > 2 && i >= 1 + 2 * root as usize && (!pv_node || is_quiet) {
+                        let n = i as i32 + 1;
+                        r = ilog2i(n) / 2 + ilog2i(depth) / 2
+                            - (!is_quiet || pv_node) as i32
+                            - (hist[i] + 15000) / 30000
+                            + 2 * cut_node as i32
+                            + 1;
+                        r = r.clamp(0, (new_depth - 1).max(0));
+                    }
+                } else if depth >= 3 && reducible && !in_check {
                     // Accumulated in 1024ths and divided at the end, so a term
                     // can be worth a third of a ply instead of all or nothing.
                     // The first version added whole plies, and the cut node term
