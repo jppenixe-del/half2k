@@ -2307,12 +2307,28 @@ impl Searcher {
                 // something added to a static evaluation of the same position.
                 // A stored upper bound below the static score makes the floor
                 // pessimistic, and pruning a capture against a pessimistic
-                // floor throws away captures that were good: measured, the
-                // difference was three wins against thirty-four losses.
-                if static_eval != TT_EVAL_NONE as i32
-                    && static_eval + taken + promo + 200 <= alpha
-                {
-                    continue;
+                // floor throws away captures that were good.
+                //
+                // A skipped move still says something. The value it could not
+                // beat is an honest lower bound on what this node is worth --
+                // the capture was not searched, but it was not refuted either,
+                // and if every remaining move is skipped the same way then this
+                // is the best the node can show for itself. Dropping it instead
+                // makes the node return less than it knows, and that
+                // underestimate travels up the tree and into the table.
+                //
+                // That omission was the whole of it. Basing the test on the
+                // static score rather than the table's floor was correct and
+                // was not enough: with the value discarded the switch still
+                // cost 129 Elo, thirty-two percent over sixty-two games.
+                if static_eval != TT_EVAL_NONE as i32 {
+                    let futile = static_eval + taken + promo + 200;
+                    if futile <= alpha {
+                        if futile > best {
+                            best = futile;
+                        }
+                        continue;
+                    }
                 }
             }
 
