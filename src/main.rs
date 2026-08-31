@@ -135,7 +135,33 @@ fn install_net(path: &str) -> &'static nnue::Network {
     }
 }
 
+/// End quietly when the other end of the pipe is gone.
+///
+/// Rust ignores SIGPIPE so that a closed pipe arrives as an error on write,
+/// which is the right default for a program that has something to do about
+/// it. Every write this program makes is a line of protocol to a front end,
+/// and once that front end has closed the pipe there is no one left to tell.
+/// The standard library's answer is to panic inside `println!`, which turns a
+/// normal end of session into a wall of backtraces in the tournament log and
+/// reads as a crash. Taking the Unix default instead ends the process where
+/// the write happens, silently, which is what every other engine does.
+#[cfg(unix)]
+fn restore_sigpipe() {
+    unsafe {
+        extern "C" {
+            fn signal(sig: i32, handler: usize) -> usize;
+        }
+        const SIGPIPE: i32 = 13;
+        const SIG_DFL: usize = 0;
+        signal(SIGPIPE, SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn restore_sigpipe() {}
+
 fn main() {
+    restore_sigpipe();
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
         Some("perft") => {
