@@ -305,6 +305,8 @@ pub struct Features {
     pub check_ext: bool,
     /// Credit the stored move when the table itself produces the cutoff.
     pub tt_cut_credit: bool,
+    /// Remember which captures worked, not only what they take.
+    pub capture_hist: bool,
 
     /// Reduce harder at a node that is expected to fail high.
     ///
@@ -339,6 +341,7 @@ impl Default for Features {
             rfp_damp: false,
             check_ext: false,
             tt_cut_credit: false,
+            capture_hist: false,
             cut_node_lmr: true,
             history_prune: true,
             tm_stability: true,
@@ -364,6 +367,7 @@ impl Features {
             "rfpdamp" => self.rfp_damp = on,
             "checkext" => self.check_ext = on,
             "ttcutcredit" => self.tt_cut_credit = on,
+            "capturehist" => self.capture_hist = on,
             "cutnodelmr" => self.cut_node_lmr = on,
             "historyprune" => self.history_prune = on,
             "tmstability" => self.tm_stability = on,
@@ -374,7 +378,7 @@ impl Features {
     }
 
     /// The ones the reference does not have. All default off.
-    pub const EXTRA: [&'static str; 12] = [
+    pub const EXTRA: [&'static str; 13] = [
         "CorrHist",
         "Razoring",
         "Rule50Fade",
@@ -387,6 +391,7 @@ impl Features {
         "RfpDamp",
         "CheckExt",
         "TtCutCredit",
+        "CaptureHist",
     ];
 
     /// The ones it does have, so they are in the baseline. All default on.
@@ -440,6 +445,14 @@ pub struct Searcher {
     /// `[slot][prev piece * 64 + prev to][piece][to]`, one table per distance
     /// back.
     conthist: Vec<Vec<[[i32; 64]; 6]>>,
+    /// `[moving piece][destination][captured piece]`.
+    ///
+    /// What a capture takes is known before it is played; whether taking it
+    /// works is not. Most valuable victim answers the first question and calls
+    /// it the second -- so a queen recapture that always loses to a pin keeps
+    /// being tried first, forever, because the queen is still the biggest piece
+    /// on the square.
+    capthist: Vec<[[i32; 6]; 64]>,
     /// Zobrist keys along the path plus the game so far, for repetition.
     keys: Vec<u64>,
     /// How many of `keys` are game history rather than search path.
@@ -574,6 +587,7 @@ impl Searcher {
             corr: vec![[0; CORR_SIZE]; 2],
             played: [None; MAX_PLY],
             conthist: vec![vec![[[0; 64]; 6]; 6 * 64]; CONT_SLOTS],
+            capthist: vec![[[0; 6]; 64]; 6],
             keys: Vec::with_capacity(1024),
             root_keys: 0,
             pv: [[None; MAX_PLY]; MAX_PLY],
@@ -602,6 +616,7 @@ impl Searcher {
         self.history = [[[0; 64]; 64]; 2];
         self.corr = vec![[0; CORR_SIZE]; 2];
         self.conthist = vec![vec![[[0; 64]; 6]; 6 * 64]; CONT_SLOTS];
+        self.capthist = vec![[[0; 6]; 64]; 6];
     }
 
     /// The static score, adjusted by what the search has been saying about
@@ -1255,6 +1270,7 @@ impl Searcher {
         let mut best_move = None;
         let alpha_orig = alpha;
         let mut searched_quiets: Vec<Move> = Vec::new();
+        let mut searched_captures: Vec<Move> = Vec::new();
 
         let tt_score_for_singular = entry
             .filter(|e| e.has_bound())
@@ -1566,6 +1582,15 @@ impl Searcher {
                     if alpha >= beta {
                         if is_quiet {
                             self.on_beta_cutoff(board, mv, ply, depth, &searched_quiets);
+                        } else {
+                            self.credit_capture(board, mv, hist_bonus(depth));
+                        }
+                        // Captures tried and passed over were wrong here
+                        // whatever ended the node, quiet or not.
+                        for c in &searched_captures {
+                            if *c != mv {
+                                self.credit_capture(board, *c, -hist_bonus(depth));
+                            }
                         }
                         break;
                     }
@@ -1574,6 +1599,8 @@ impl Searcher {
 
             if is_quiet {
                 searched_quiets.push(mv);
+            } else {
+                searched_captures.push(mv);
             }
         }
 
@@ -1834,6 +1861,48 @@ impl Searcher {
         }
     }
 
+    /// What a capture is worth by past results, zero when the table is off.
+    #[inline]
+    fn capt_score(&self, board: &Board, mv: &Move) -> i32 {
+        if !self.features.capture_hist {
+            return 0;
+        }
+        let pc = match board.piece_at(mv.from) {
+            Some((pt, _)) => pt.idx(),
+            None => return 0,
+        };
+        let victim = if mv.flag == MoveFlag::EnPassant {
+            PieceType::Pawn.idx()
+        } else {
+            match board.piece_at(mv.to) {
+                Some((pt, _)) => pt.idx(),
+                None => return 0,
+            }
+        };
+        self.capthist[pc][mv.to as usize][victim]
+    }
+
+    /// Move a capture for or against by past results.
+    #[inline]
+    fn credit_capture(&mut self, board: &Board, mv: Move, bonus: i32) {
+        if !self.features.capture_hist {
+            return;
+        }
+        let pc = match board.piece_at(mv.from) {
+            Some((pt, _)) => pt.idx(),
+            None => return,
+        };
+        let victim = if mv.flag == MoveFlag::EnPassant {
+            PieceType::Pawn.idx()
+        } else {
+            match board.piece_at(mv.to) {
+                Some((pt, _)) => pt.idx(),
+                None => return,
+            }
+        };
+        hist_add(&mut self.capthist[pc][mv.to as usize][victim], bonus, HIST_MAX_CONT);
+    }
+
     /// Move one move for and every other move against, by the same amount.
     #[inline]
     fn credit(
@@ -1938,10 +2007,11 @@ impl Searcher {
                     // leaves there is not, so only the clearly good ones go
                     // first.
                     let bar = (-50 * (depth - 1)).max(-250);
+                    let past = self.capt_score(board, mv) / 16;
                     if see::see_ge(&self.atk, board, mv, bar) {
-                        600_000 + mvv
+                        600_000 + mvv + past
                     } else {
-                        -600_000 + mvv
+                        -600_000 + mvv + past
                     }
                 } else if mv.promotion == Some(PieceType::Queen) {
                     500_000
