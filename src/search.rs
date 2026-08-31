@@ -1188,15 +1188,29 @@ impl Searcher {
         board.halfmove >= 100 || self.is_repetition(board)
     }
 
-    /// What a drawn position is worth to the side to move.
+    /// What a drawn position is worth, seen from the side to move at `ply`.
     ///
-    /// Negative by `contempt`, so that repeating is worse than continuing. The
-    /// sign matters and is easy to get backwards: this is returned from the
-    /// point of view of whoever is to move, and it is THEY who should be
-    /// reluctant.
+    /// The value belongs to the root, not to whoever happens to be on the move.
+    /// Returning `-contempt` at every node makes both sides reluctant, and in a
+    /// negamax that is not a preference, it is a contradiction: the root reads
+    /// its own draws as costing `contempt` and the opponent's draws as gaining
+    /// it, so the same drawn position is worth two different things depending
+    /// on the parity of the ply it was found at.
+    ///
+    /// Measured with the old version, at a contempt of twenty over 176 games:
+    /// fifty wins, forty-two draws and eighty-four losses, which is 68 Elo
+    /// worse and the whole interval below zero. The engine was declining draws
+    /// in positions it was losing, which is where it wanted them.
+    ///
+    /// Alternating with the ply is what makes the root read a draw as costing
+    /// `contempt` everywhere.
     #[inline]
-    pub(crate) fn draw_score(&self) -> i32 {
-        -self.params.contempt
+    pub(crate) fn draw_score(&self, ply: usize) -> i32 {
+        if ply & 1 == 1 {
+            self.params.contempt
+        } else {
+            -self.params.contempt
+        }
     }
 
     pub fn go(&mut self, board: &mut Board, limits: &Limits, info: bool) -> Option<Move> {
@@ -1464,7 +1478,7 @@ impl Searcher {
 
         if !root {
             if self.is_draw(board) {
-                return self.draw_score();
+                return self.draw_score(ply);
             }
             if ply >= MAX_PLY - 1 {
                 return evaluate(board, self.features.rule50_fade);
@@ -2159,7 +2173,7 @@ impl Searcher {
             return evaluate(board, self.features.rule50_fade);
         }
         if self.is_draw(board) {
-            return self.draw_score();
+            return self.draw_score(ply);
         }
 
         let in_check = board.in_check(board.side, &self.atk);
