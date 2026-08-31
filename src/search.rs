@@ -121,6 +121,17 @@ pub struct Params {
     pub asp_depth: i32,
     pub sing_depth: i32,
     pub sing_margin: i32,
+    /// How far below the singular window a move has to fall to earn a second
+    /// ply rather than one.
+    pub double_ext: i32,
+    /// Reductions accumulate in 1024ths and divide at the end, so a term can be
+    /// worth a third of a ply instead of all or nothing. These are in those
+    /// units.
+    pub lmr_cut_f: i32,
+    pub lmr_nonpv_f: i32,
+    pub lmr_ttpv_f: i32,
+    /// A stored lower bound this far above beta already answers the question.
+    pub probcut_margin: i32,
     pub tm_mtg: i32,
     /// percent of the increment spent each move
     pub tm_inc_pct: i32,
@@ -156,6 +167,11 @@ impl Default for Params {
             asp_depth: 4,
             sing_depth: 5,
             sing_margin: 2,
+            double_ext: 40,
+            lmr_cut_f: 2048,
+            lmr_nonpv_f: 1024,
+            lmr_ttpv_f: 1024,
+            probcut_margin: 375,
             tm_mtg: 25,
             tm_inc_pct: 75,
             tm_hard_mult: 2,
@@ -192,6 +208,11 @@ pub const PARAM_SPECS: &[ParamSpec] = &[
     ("AspDepth", |p| p.asp_depth, |p, v| p.asp_depth = v, 2, 10),
     ("SingDepth", |p| p.sing_depth, |p, v| p.sing_depth = v, 4, 12),
     ("SingMargin", |p| p.sing_margin, |p, v| p.sing_margin = v, 1, 8),
+    ("DoubleExt", |p| p.double_ext, |p, v| p.double_ext = v, 5, 200),
+    ("LmrCutF", |p| p.lmr_cut_f, |p, v| p.lmr_cut_f = v, 0, 2048),
+    ("LmrNonPvF", |p| p.lmr_nonpv_f, |p, v| p.lmr_nonpv_f = v, 0, 2048),
+    ("LmrTtPvF", |p| p.lmr_ttpv_f, |p, v| p.lmr_ttpv_f = v, 0, 2048),
+    ("ProbcutMargin", |p| p.probcut_margin, |p, v| p.probcut_margin = v, 100, 1024),
     ("TmMtg", |p| p.tm_mtg, |p, v| p.tm_mtg = v, 10, 40),
     ("TmIncPct", |p| p.tm_inc_pct, |p, v| p.tm_inc_pct = v, 20, 95),
     ("TmHardMult", |p| p.tm_hard_mult, |p, v| p.tm_hard_mult = v, 1, 6),
@@ -237,6 +258,15 @@ pub struct Features {
     pub qs_futility: bool,
     /// Spend less when most of the tree went to the move that won anyway.
     pub tm_node_effort: bool,
+    /// Trust a stored lower bound far enough above beta without re-searching.
+    pub probcut: bool,
+    /// Only try the null move where the node is expected to fail high.
+    pub nmp_cut_node: bool,
+    /// On a reverse futility cutoff, return part of the way to the estimate
+    /// rather than all of it.
+    pub rfp_damp: bool,
+    /// Extend a move that gives check.
+    pub check_ext: bool,
 
     /// Reduce harder at a node that is expected to fail high.
     ///
@@ -266,6 +296,10 @@ impl Default for Features {
             lmp_improving: false,
             qs_futility: false,
             tm_node_effort: false,
+            probcut: false,
+            nmp_cut_node: false,
+            rfp_damp: false,
+            check_ext: false,
             cut_node_lmr: true,
             history_prune: true,
             tm_stability: true,
@@ -286,6 +320,10 @@ impl Features {
             "lmpimproving" => self.lmp_improving = on,
             "qsfutility" => self.qs_futility = on,
             "tmnodeeffort" => self.tm_node_effort = on,
+            "probcut" => self.probcut = on,
+            "nmpcutnode" => self.nmp_cut_node = on,
+            "rfpdamp" => self.rfp_damp = on,
+            "checkext" => self.check_ext = on,
             "cutnodelmr" => self.cut_node_lmr = on,
             "historyprune" => self.history_prune = on,
             "tmstability" => self.tm_stability = on,
@@ -296,7 +334,7 @@ impl Features {
     }
 
     /// The ones the reference does not have. All default off.
-    pub const EXTRA: [&'static str; 8] = [
+    pub const EXTRA: [&'static str; 12] = [
         "CorrHist",
         "Razoring",
         "Rule50Fade",
@@ -305,6 +343,10 @@ impl Features {
         "LmpImproving",
         "QsFutility",
         "TmNodeEffort",
+        "Probcut",
+        "NmpCutNode",
+        "RfpDamp",
+        "CheckExt",
     ];
 
     /// The ones it does have, so they are in the baseline. All default on.
@@ -900,14 +942,6 @@ impl Searcher {
             alpha = a;
         }
 
-        // A king already in check has no quiet evaluation and the branch is
-        // forcing, so it is worth another ply -- but only while the position is
-        // still a contest. Extending every check in a position already decided
-        // spends the search on lines that change nothing.
-        if in_check && depth < MAX_PLY as i32 {
-            depth += 1;
-        }
-
         // A node searching with a move excluded is asking a different question
         // from the one the table answered, so it must not take the answer --
         // nor leave its own answer behind for a node that is asking the
@@ -958,7 +992,55 @@ impl Searcher {
         };
 
         self.eval_stack[ply] = static_eval;
-        let improving = !in_check && ply >= 2 && static_eval > self.eval_stack[ply - 2];
+        // Is the side to move better off than it was two plies ago?
+        //
+        // A ply spent in check has no static evaluation and its slot holds a
+        // sentinel, not a score. Comparing against the sentinel made every
+        // position for two plies after any check look like it was improving,
+        // because anything beats minus thirty two thousand -- so reverse
+        // futility pruned harder and late move pruning cut later, both on a
+        // fact that was not one. Step back four plies when two are not usable,
+        // and claim nothing when neither is.
+        let usable = |v: i32| v != TT_EVAL_NONE as i32;
+        let improving = if in_check {
+            false
+        } else if ply >= 2 && usable(self.eval_stack[ply - 2]) {
+            static_eval > self.eval_stack[ply - 2]
+        } else if ply >= 4 && usable(self.eval_stack[ply - 4]) {
+            static_eval > self.eval_stack[ply - 4]
+        } else {
+            false
+        };
+
+        // Two evaluations from here on, and they are not the same number.
+        //
+        // `static_eval` is what the network says, corrected, and it is what
+        // `improving` and the forward futility margin compare against -- both
+        // want a value that means the same thing at every ply, which a score
+        // borrowed from a search does not.
+        //
+        // `pruning_eval` is that value improved by what the table already
+        // knows. A stored lower bound above the static score, or an upper
+        // bound below it, is a better estimate than the static score by
+        // definition: a search went and found out. Whole-node pruning should
+        // use the better one, and it was using the worse one.
+        let mut pruning_eval = static_eval;
+        if !in_check {
+            if let Some(e) = entry {
+                if e.has_bound() {
+                    let ts = score_from_tt(e.score, ply);
+                    let better = match e.bound {
+                        Bound::Exact => true,
+                        Bound::Lower => ts > static_eval,
+                        Bound::Upper => ts < static_eval,
+                        Bound::NoBound => false,
+                    };
+                    if better {
+                        pruning_eval = ts;
+                    }
+                }
+            }
+        }
 
         if !pv_node && !in_check {
             // Reverse futility: so far ahead that giving away the margin still
@@ -969,10 +1051,18 @@ impl Searcher {
             let margin = self.params.rfp_margin * depth
                 - self.params.rfp_improving * improving as i32;
             if depth < self.params.rfp_depth
-                && static_eval - margin >= beta
-                && static_eval.abs() < MATE_IN_MAX
+                && pruning_eval - margin >= beta
+                && pruning_eval.abs() < MATE_IN_MAX
             {
-                return static_eval;
+                // Part of the way to the estimate rather than all of it. The
+                // margin establishes that the node is above beta, not by how
+                // much, and returning the whole distance passes upwards a
+                // confidence that was never earned.
+                return if self.features.rfp_damp {
+                    beta + (pruning_eval - beta) / 3
+                } else {
+                    pruning_eval
+                };
             }
 
             // Razoring: so far behind that even the quiescence search is
@@ -981,7 +1071,7 @@ impl Searcher {
             // score comes back above alpha and the node is searched properly.
             if self.features.razoring
                 && depth <= 3
-                && static_eval + self.params.razor_margin * depth < alpha
+                && pruning_eval + self.params.razor_margin * depth < alpha
             {
                 let q = self.quiescence(board, alpha, alpha + 1, ply);
                 if q < alpha {
@@ -1002,16 +1092,20 @@ impl Searcher {
             // one, and the uncorrected one has to be within reach of beta. A
             // position that only looks good because the table said so is not
             // one to hand a free move away in.
-            if depth >= 3
-                && static_eval >= beta
-                && static_eval >= self.eval_stack[ply]
+            // Only where the node is expected to fail high. Elsewhere the
+            // question null move asks -- is this so good it survives giving a
+            // move away -- is not the question the node is there to answer.
+            if (!self.features.nmp_cut_node || cut_node)
+                && depth >= 3
+                && pruning_eval >= beta
+                && pruning_eval >= self.eval_stack[ply]
                 && self.eval_stack[ply]
                     >= beta - 20 * depth - 40 * improving as i32 + 100
                 && has_pieces(board, board.side)
                 && !(ply > 0 && self.null_at[ply - 1])
             {
                 let r = self.params.nmp_base
-                    + ((static_eval - beta) / 200).min(self.params.nmp_div);
+                    + ((pruning_eval - beta) / 200).min(self.params.nmp_div);
                 let undo = board.make_null_move();
                 self.keys.push(board.hash);
                 self.null_at[ply] = true;
@@ -1035,6 +1129,24 @@ impl Searcher {
         // than finding it a ply shallower and coming back.
         if self.features.iir && depth >= 4 && tt_move.is_none() {
             depth -= 1;
+        }
+
+        // A stored lower bound far enough above beta already answers the
+        // question this node was about to ask, even at a depth we would not
+        // normally trust. It cost a search once; there is no reason to pay
+        // again to be told the same thing by a smaller margin.
+        if self.features.probcut && !pv_node && !in_check && excluded.is_none() {
+            if let Some(e) = entry {
+                if matches!(e.bound, Bound::Lower | Bound::Exact)
+                    && e.depth >= depth - 2
+                    && beta.abs() < MATE_IN_MAX
+                {
+                    let ts = score_from_tt(e.score, ply);
+                    if !is_mate(ts) && ts >= beta + self.params.probcut_margin {
+                        return ts;
+                    }
+                }
+            }
         }
 
         let mut moves = generate_legal(board, &self.atk);
@@ -1095,11 +1207,29 @@ impl Searcher {
                         }
                         if s < target {
                             extension = 1;
+                            // Not merely singular but singular by a distance:
+                            // every alternative fell a long way short, so the
+                            // line is even narrower than one ply of extension
+                            // says. Outside the principal variation only, where
+                            // being wrong costs a subtree rather than the move
+                            // we play.
+                            if !pv_node && s < target - self.params.double_ext {
+                                extension = 2;
+                            }
                         } else if target >= beta {
                             // Every other move also beats beta, so the position
                             // is winning for reasons that do not depend on this
                             // one and the whole subtree can go.
                             return target;
+                        } else if !pv_node && !is_mate(s) && s >= beta {
+                            return s;
+                        } else if ts >= beta {
+                            // The table says this move fails high, and the
+                            // search just said it is not the only one that
+                            // does. A node with several good answers is the
+                            // opposite of the case worth extending, so take a
+                            // ply off rather than adding one.
+                            extension = -1;
                         }
                     }
                 }
@@ -1194,6 +1324,18 @@ impl Searcher {
             self.tt.prefetch(board.hash);
             self.keys.push(board.hash);
 
+            // A move that gives check is forcing: the reply is constrained and
+            // the line is worth another ply. Only while the score says the game
+            // is still a contest, since a check in a decided position extends
+            // something that changes nothing.
+            if self.features.check_ext
+                && board.in_check(board.side, &self.atk)
+                && static_eval != TT_EVAL_NONE as i32
+                && static_eval.abs() > self.params.check_ext_eval
+            {
+                extension = extension.max(1);
+            }
+
             let new_depth = depth - 1 + extension;
 
             let mut score;
@@ -1218,31 +1360,35 @@ impl Searcher {
 
                 let mut r = 0;
                 if depth >= 3 && reducible && !in_check {
-                    r = self.lmr[(depth as usize).min(63)][i.min(63)];
+                    // Accumulated in 1024ths and divided at the end, so a term
+                    // can be worth a third of a ply instead of all or nothing.
+                    // The first version added whole plies, and the cut node term
+                    // alone was two of them where a third of one is the right
+                    // size. Five times too much, which is exactly why measuring
+                    // it found it doing no good.
+                    let mut r1024 = self.lmr[(depth as usize).min(63)][i.min(63)] * 1024;
                     if !is_quiet {
                         // Half as hard for a capture: it changes the material,
                         // so a mistake about it costs more than a mistake about
                         // a quiet move.
-                        r = (r + 1) / 2;
+                        r1024 /= 2;
+                    }
+                    if self.features.cut_node_lmr && cut_node {
+                        r1024 += self.params.lmr_cut_f;
+                    }
+                    if !pv_node {
+                        r1024 += self.params.lmr_nonpv_f;
                     }
                     // A position that once earned a full window is less likely
                     // to be the throwaway this reduction assumes.
                     if self.features.ttpv_lmr && tt_pv {
-                        r -= 1;
-                    }
-                    if !pv_node {
-                        r += 1;
+                        r1024 -= self.params.lmr_ttpv_f;
                     }
                     // A move the history likes gets the benefit of the doubt,
                     // one it dislikes gets less of it.
-                    r -= (scores[i] / self.params.lmr_hist_div.max(1)).clamp(-2, 2);
-                    // A node expected to fail high does it early or not at all,
-                    // so its late moves are worth less than late moves
-                    // elsewhere and can be cut deeper.
-                    if self.features.cut_node_lmr && cut_node {
-                        r += self.params.lmr_cut;
-                    }
-                    r = r.clamp(0, (new_depth - 1).max(0));
+                    r1024 -= (scores[i] * 1024 / self.params.lmr_hist_div.max(1))
+                        .clamp(-2048, 2048);
+                    r = (r1024 / 1024).clamp(0, (new_depth - 1).max(0));
                 }
                 // A reduced scout search is looking for a reason to stop, so
                 // the child is treated as expecting to fail high.
