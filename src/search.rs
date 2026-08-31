@@ -104,6 +104,12 @@ pub struct Features {
     /// trained against has it, so it belongs in the baseline rather than on top
     /// of it -- the switch is here to measure it, not to leave it out.
     pub cut_node_lmr: bool,
+
+    /// Skip a quiet move the history has consistently disliked.
+    pub history_prune: bool,
+
+    /// Reduce late captures too, not only late quiet moves.
+    pub lmr_captures: bool,
 }
 
 impl Default for Features {
@@ -116,6 +122,8 @@ impl Default for Features {
             iir: false,
             lmp_improving: false,
             cut_node_lmr: true,
+            history_prune: true,
+            lmr_captures: true,
         }
     }
 }
@@ -131,6 +139,8 @@ impl Features {
             "iir" => self.iir = on,
             "lmpimproving" => self.lmp_improving = on,
             "cutnodelmr" => self.cut_node_lmr = on,
+            "historyprune" => self.history_prune = on,
+            "lmrcaptures" => self.lmr_captures = on,
             _ => return false,
         }
         true
@@ -147,7 +157,7 @@ impl Features {
     ];
 
     /// The ones it does have, so they are in the baseline. All default on.
-    pub const BASELINE: [&'static str; 1] = ["CutNodeLmr"];
+    pub const BASELINE: [&'static str; 3] = ["CutNodeLmr", "HistoryPrune", "LmrCaptures"];
 }
 
 #[derive(Default, Clone)]
@@ -848,6 +858,24 @@ impl Searcher {
                     if depth <= 6 && static_eval + 120 + 130 * depth <= alpha {
                         break;
                     }
+
+                    // History pruning. A quiet move the tables have disliked
+                    // this consistently, at a depth this shallow, is not worth
+                    // the node. The threshold grows with the square of the
+                    // depth so that it only bites where being wrong is cheap.
+                    //
+                    // The constant is in OUR history units and had to be. Taken
+                    // straight from a reference whose tables run to about
+                    // 105000, against ours that cap near 24500, it never once
+                    // fired -- the two runs came back with byte-identical node
+                    // counts, which is what a dead branch looks like from
+                    // outside.
+                    if self.features.history_prune
+                        && depth <= 4
+                        && scores[i] < -150 * depth * depth
+                    {
+                        continue;
+                    }
                 } else if depth <= 8 && !see::see_ge(&self.atk, board, &mv, -90 * depth) {
                     // A capture that loses more than the depth could plausibly
                     // win back.
@@ -878,9 +906,24 @@ impl Searcher {
                 // Late move reductions: the ordering has already put the moves
                 // most likely to be best first, so the ones at the back are
                 // searched shallower until one of them proves otherwise.
+                // Late captures are reduced too, outside the principal
+                // variation. A capture is not automatically worth a full look
+                // just for being a capture -- the ones that were worth it are
+                // already at the front of the list, and the ones down here have
+                // been sorted below quiet moves by static exchange for a
+                // reason.
+                let reducible = is_quiet
+                    || (self.features.lmr_captures && !pv_node && depth >= 3);
+
                 let mut r = 0;
-                if depth >= 3 && is_quiet && !in_check {
+                if depth >= 3 && reducible && !in_check {
                     r = lmr_table()[(depth as usize).min(63)][i.min(63)];
+                    if !is_quiet {
+                        // Half as hard for a capture: it changes the material,
+                        // so a mistake about it costs more than a mistake about
+                        // a quiet move.
+                        r = (r + 1) / 2;
+                    }
                     // A position that once earned a full window is less likely
                     // to be the throwaway this reduction assumes.
                     if self.features.ttpv_lmr && tt_pv {
