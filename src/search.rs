@@ -1777,6 +1777,9 @@ impl Searcher {
             .filter(|e| e.has_bound())
             .map(|e| score_from_tt(e.score, ply));
 
+        // Once the quiet moves are done with, the captures behind them are not.
+        let mut skip_quiets = false;
+
         for i in 0..moves.len() {
             Self::pick(&mut moves, &mut scores, &mut hist, i);
             let mv = moves[i];
@@ -1784,7 +1787,110 @@ impl Searcher {
                 continue;
             }
             let is_quiet = !mv.is_capture() && mv.promotion.is_none();
+            if skip_quiets && is_quiet {
+                continue;
+            }
             let mut extension = 0;
+
+            // The order below is not ours to choose. Late move count, then the
+            // exchange test on captures, then history, then the static margin,
+            // then the exchange test on quiets -- the sequence the engines that
+            // measured it settled on, cheapest question first so the expensive
+            // ones are never asked about a move that is already gone.
+            //
+            // Everything here needs a score already in hand: without one, the
+            // node has nothing to compare a margin against and skipping moves
+            // risks reporting a mate that is not there.
+            if !root
+                && !pv_node
+                && !in_check
+                && best_score > -MATE_IN_MAX
+                && has_pieces(board, board.side)
+            {
+                if is_quiet {
+                    // Late move pruning: past a certain count at low depth,
+                    // the ordering has been wrong often enough that the rest
+                    // are not worth the nodes.
+                    //
+                    // It stops the QUIETS, not the loop. Losing captures score
+                    // below every quiet move and are therefore last in the
+                    // list, so breaking here threw all of them away as well --
+                    // a rule about quiet moves silently deleting captures.
+                    let full = self.params.lmp_base + depth * depth;
+                    let count = if !self.features.lmp_improving || improving {
+                        full
+                    } else {
+                        full / 2
+                    };
+                    if depth <= self.params.lmp_depth && i >= count as usize {
+                        skip_quiets = true;
+                        continue;
+                    }
+
+                    // History pruning. A quiet move the tables have disliked
+                    // this consistently, at a depth this shallow, is not worth
+                    // the node. The threshold grows with the square of the
+                    // depth so that it only bites where being wrong is cheap.
+                    //
+                    // The constant is in OUR history units and had to be. Taken
+                    // straight from a design whose tables run to about
+                    // 105000, against ours that cap near 24500, it never once
+                    // fired -- the two runs came back with byte-identical node
+                    // counts, which is what a dead branch looks like from
+                    // outside.
+                    if self.features.history_prune
+                        && depth <= 4
+                        && hist[i] < -self.params.hist_prune * depth * depth
+                    {
+                        continue;
+                    }
+
+                    // Futility: even handed the margin, this move does not
+                    // reach alpha, and a quiet move does not change the
+                    // material to make up the difference. The history term
+                    // belongs here: a move the tables like is worth trying even
+                    // when the margin says otherwise, and one they dislike is
+                    // worth less than the margin suggests. Its divisor is in
+                    // OUR history units, which run about five and a half times
+                    // smaller.
+                    //
+                    // This one stopped the loop too. Quiets are ordered by
+                    // history, so a later quiet does fail the same test -- but
+                    // the captures behind them do not, and were going with it.
+                    let hist_term = hist[i] / self.params.fut_hist_div.max(1);
+                    if depth <= self.params.fut_depth
+                        && static_eval
+                            + self.params.fut_base
+                            + self.params.fut_slope * depth
+                            + hist_term
+                            <= alpha
+                    {
+                        skip_quiets = true;
+                        continue;
+                    }
+
+                    // A quiet move can still lose material -- walking a piece
+                    // onto a square where it is taken for nothing. Static
+                    // exchange says so before the search has to find out, and
+                    // it is asked last because it is the dearest question here.
+                    if depth <= 8
+                        && !see::see_ge(
+                            &self.atk,
+                            board,
+                            &mv,
+                            -self.params.see_prune_quiet * (depth + depth * depth),
+                        )
+                    {
+                        continue;
+                    }
+                } else if depth <= 8
+                    && !see::see_ge(&self.atk, board, &mv, -self.params.see_prune * depth)
+                {
+                    // A capture that loses more than the depth could plausibly
+                    // win back.
+                    continue;
+                }
+            }
 
             // Singular extension. If the table says this move is good enough to
             // fail high, search every OTHER move against a window just below
@@ -1845,89 +1951,6 @@ impl Searcher {
                             extension = -1;
                         }
                     }
-                }
-            }
-
-            // Everything here needs a score already in hand: without one, the
-            // node has nothing to compare a margin against and skipping moves
-            // risks reporting a mate that is not there.
-            if !root
-                && !pv_node
-                && !in_check
-                && best_score > -MATE_IN_MAX
-                && has_pieces(board, board.side)
-            {
-                if is_quiet {
-                    // Late move pruning: past a certain count at low depth,
-                    // the ordering has been wrong often enough that the rest
-                    // are not worth the nodes.
-                    let full = self.params.lmp_base + depth * depth;
-                    let count = if !self.features.lmp_improving || improving {
-                        full
-                    } else {
-                        full / 2
-                    };
-                    if depth <= self.params.lmp_depth && i >= count as usize {
-                        break;
-                    }
-
-                    // Futility: even handed the margin, this move does not
-                    // reach alpha, and a quiet move does not change the
-                    // material to make up the difference.
-                    // The history term belongs here:
-                    // a move the tables like is worth trying even when the
-                    // margin says otherwise, and one they dislike is worth
-                    // less than the margin suggests. Its divisor is in OUR
-                    // history units, which run about five and a half times
-                    // smaller.
-                    let hist_term = hist[i] / self.params.fut_hist_div.max(1);
-                    if depth <= self.params.fut_depth
-                        && static_eval
-                            + self.params.fut_base
-                            + self.params.fut_slope * depth
-                            + hist_term
-                            <= alpha
-                    {
-                        break;
-                    }
-
-                    // History pruning. A quiet move the tables have disliked
-                    // this consistently, at a depth this shallow, is not worth
-                    // the node. The threshold grows with the square of the
-                    // depth so that it only bites where being wrong is cheap.
-                    //
-                    // The constant is in OUR history units and had to be. Taken
-                    // straight from a design whose tables run to about
-                    // 105000, against ours that cap near 24500, it never once
-                    // fired -- the two runs came back with byte-identical node
-                    // counts, which is what a dead branch looks like from
-                    // outside.
-                    if self.features.history_prune
-                        && depth <= 4
-                        && hist[i] < -self.params.hist_prune * depth * depth
-                    {
-                        continue;
-                    }
-
-                    // A quiet move can still lose material -- walking a piece
-                    // onto a square where it is taken for nothing. Static
-                    // exchange says so before the search has to find out.
-                    if depth <= 8
-                        && !see::see_ge(
-                            &self.atk,
-                            board,
-                            &mv,
-                            -self.params.see_prune_quiet * (depth + depth * depth),
-                        )
-                    {
-                        continue;
-                    }
-                } else if depth <= 8
-                    && !see::see_ge(&self.atk, board, &mv, -self.params.see_prune * depth)
-                {
-                    // A capture that loses more than the depth could plausibly
-                    // win back.
-                    continue;
                 }
             }
 
