@@ -1204,6 +1204,19 @@ impl Searcher {
     ///
     /// Alternating with the ply is what makes the root read a draw as costing
     /// `contempt` everywhere.
+    ///
+    /// Getting the sign right did not make the idea pay. Re-measured with the
+    /// alternation in place, at the same contempt of twenty over 183 games:
+    /// fifty-three wins, fifty draws, eighty losses, 52 Elo worse and still the
+    /// whole interval below zero. Better than the 68 it cost with both sides
+    /// reluctant, and still a loss.
+    ///
+    /// It is not that the number is too big. Twenty here is a tenth of a pawn,
+    /// half what the engine this was taken from uses. Whatever half points are
+    /// won by refusing a repetition are being paid for by refusing one that
+    /// should have been taken, and no flat number tells those apart. Scaling it
+    /// by how far ahead the search already thinks it is would, and that is a
+    /// different piece of work.
     #[inline]
     pub(crate) fn draw_score(&self, ply: usize) -> i32 {
         if ply & 1 == 1 {
