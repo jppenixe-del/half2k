@@ -61,14 +61,49 @@ const CORR_SIZE: usize = 16384;
 const CORR_GRAIN: i32 = 256;
 const CORR_MAX: i32 = 32 * CORR_GRAIN;
 
+/// How many separate readings of "what kind of position is this" the
+/// correction is spread over.
+///
+/// One key was pawn structure alone, which is the classic and the weakest: two
+/// positions with the same pawns and completely different pieces share an
+/// entry and teach each other nothing useful. Five keys, each answering a
+/// narrower question, means a correction learned about a rook ending is filed
+/// where a rook ending will find it.
+pub const CORR_KINDS: usize = 5;
+
 #[inline]
-fn corr_index(board: &Board) -> usize {
-    let w = board.pieces[Color::White.idx()][PieceType::Pawn.idx()];
-    let b = board.pieces[Color::Black.idx()][PieceType::Pawn.idx()];
-    let mut z = w.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(b);
+fn mix(x: u64) -> u64 {
+    let mut z = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    ((z ^ (z >> 31)) as usize) & (CORR_SIZE - 1)
+    z ^ (z >> 31)
+}
+
+/// The five indices for this position, in order: pawns, everything that is not
+/// a pawn, the majors, the minors, and what was played to get here.
+#[inline]
+fn corr_indices(board: &Board, last: Option<(usize, usize)>) -> [usize; CORR_KINDS] {
+    let p = |c: Color, t: PieceType| board.pieces[c.idx()][t.idx()];
+    let both = |t: PieceType| p(Color::White, t) | p(Color::Black, t);
+
+    let pawns = mix(p(Color::White, PieceType::Pawn))
+        ^ mix(p(Color::Black, PieceType::Pawn).wrapping_mul(3));
+    let nonpawn = mix(board.occ_all & !both(PieceType::Pawn));
+    let major = mix(both(PieceType::Rook) ^ both(PieceType::Queen).wrapping_mul(5));
+    let minor = mix(both(PieceType::Knight) ^ both(PieceType::Bishop).wrapping_mul(7));
+    let cont = match last {
+        Some((pc, to)) => mix((pc as u64) << 8 | to as u64 | 0x5eed_0000_0000),
+        None => 0,
+    };
+
+    let m = (CORR_SIZE - 1) as u64;
+    [
+        (pawns & m) as usize,
+        (nonpawn & m) as usize,
+        (major & m) as usize,
+        (minor & m) as usize,
+        (cont & m) as usize,
+    ]
 }
 
 /// How many continuation tables, and how far back each looks.
@@ -105,6 +140,46 @@ fn hist_bonus(depth: i32) -> i32 {
 #[inline]
 fn hist_add(entry: &mut i32, bonus: i32, max: i32) {
     *entry += bonus - *entry * bonus.abs() / max;
+}
+
+/// How much of the plan this search has earned, judged between iterations.
+///
+/// Four readings of "does this position still need thinking", multiplied.
+///
+/// `effort` is the share of nodes that went into the move we mean to play. A
+/// search that has poured almost everything into one move has found its answer
+/// and is confirming it; one still splitting nodes across rivals has not
+/// decided. This is the sturdiest of the four, being a ratio over millions of
+/// nodes rather than a verdict that can turn on one.
+///
+/// `settle` counts iterations that kept the same root move, and decays fast. It
+/// is deliberately the weakest term. Keying elastic time on stability ALONE was
+/// tried in an earlier engine of ours and reverted the same day: on a forced
+/// recapture, where there is nothing to decide, the root move still changed at
+/// three separate depths and each change threw the multiplier back to maximum.
+/// Stability may lengthen a search, never on its own, and never without the
+/// wall standing behind it.
+///
+/// `falling` is a score dropping between iterations, which neither of the
+/// others can see: effort stays high while a position collapses under it, and
+/// stability watches whether the move changed rather than whether it got worse.
+/// Only falls count -- paying extra for good news is how a clock is spent on
+/// won positions.
+///
+/// `instability` is a move the search keeps overturning. It separates a hard
+/// position from a slow one, which the first two cannot: both read "several
+/// moves are equally good" as difficulty, so they fire on quiet positions with
+/// many reasonable answers.
+fn time_scale(effort_frac: f64, settle: u32, score_drop: i32, changes: u32) -> f64 {
+    let effort = (1.40 - effort_frac) * 1.55;
+    let settle = (0.95 + 2.2 * (settle as f64 + 2.6).powf(-1.5)).max(1.0);
+    let falling = if score_drop > 0 {
+        (1.0 + score_drop as f64 * 0.004).min(1.5)
+    } else {
+        1.0
+    };
+    let instability = (1.0 + changes as f64 * 0.22).min(2.4);
+    (effort * settle * falling * instability).clamp(0.65, 3.4)
 }
 
 pub const MAX_PLY: usize = 128;
@@ -174,6 +249,20 @@ pub struct Params {
     pub tm_hard_mult: i32,
     /// percent of what is left that the wall may reach
     pub tm_hard_pct: i32,
+    /// Percent of the base allowance by game phase. The opening is played
+    /// rather than calculated, and a simplified position has less to find.
+    pub tm_open_pct: i32,
+    pub tm_early_pct: i32,
+    pub tm_mid_pct: i32,
+    pub tm_late_pct: i32,
+    pub tm_simple_pct: i32,
+    /// What to do about the other clock: more when comfortably ahead on it,
+    /// less when behind.
+    pub tm_ahead_pct: i32,
+    pub tm_behind_pct: i32,
+    /// Never think for less than this, so a low clock still buys a move that
+    /// was looked at rather than one that was guessed.
+    pub tm_floor_ms: i32,
 }
 
 impl Default for Params {
@@ -208,10 +297,18 @@ impl Default for Params {
             lmr_nonpv_f: 1024,
             lmr_ttpv_f: 1024,
             probcut_margin: 375,
-            tm_mtg: 25,
+            tm_mtg: 46,
             tm_inc_pct: 75,
-            tm_hard_mult: 2,
-            tm_hard_pct: 40,
+            tm_hard_mult: 4,
+            tm_hard_pct: 25,
+            tm_open_pct: 30,
+            tm_early_pct: 70,
+            tm_mid_pct: 110,
+            tm_late_pct: 100,
+            tm_simple_pct: 60,
+            tm_ahead_pct: 115,
+            tm_behind_pct: 85,
+            tm_floor_ms: 10,
         }
     }
 }
@@ -249,10 +346,18 @@ pub const PARAM_SPECS: &[ParamSpec] = &[
     ("LmrNonPvF", |p| p.lmr_nonpv_f, |p, v| p.lmr_nonpv_f = v, 0, 2048),
     ("LmrTtPvF", |p| p.lmr_ttpv_f, |p, v| p.lmr_ttpv_f = v, 0, 2048),
     ("ProbcutMargin", |p| p.probcut_margin, |p, v| p.probcut_margin = v, 100, 1024),
-    ("TmMtg", |p| p.tm_mtg, |p, v| p.tm_mtg = v, 10, 40),
+    ("TmMtg", |p| p.tm_mtg, |p, v| p.tm_mtg = v, 15, 70),
     ("TmIncPct", |p| p.tm_inc_pct, |p, v| p.tm_inc_pct = v, 20, 95),
-    ("TmHardMult", |p| p.tm_hard_mult, |p, v| p.tm_hard_mult = v, 1, 6),
+    ("TmHardMult", |p| p.tm_hard_mult, |p, v| p.tm_hard_mult = v, 1, 8),
     ("TmHardPct", |p| p.tm_hard_pct, |p, v| p.tm_hard_pct = v, 15, 70),
+    ("TmOpenPct", |p| p.tm_open_pct, |p, v| p.tm_open_pct = v, 20, 120),
+    ("TmEarlyPct", |p| p.tm_early_pct, |p, v| p.tm_early_pct = v, 40, 140),
+    ("TmMidPct", |p| p.tm_mid_pct, |p, v| p.tm_mid_pct = v, 60, 160),
+    ("TmLatePct", |p| p.tm_late_pct, |p, v| p.tm_late_pct = v, 60, 160),
+    ("TmSimplePct", |p| p.tm_simple_pct, |p, v| p.tm_simple_pct = v, 30, 140),
+    ("TmAheadPct", |p| p.tm_ahead_pct, |p, v| p.tm_ahead_pct = v, 100, 180),
+    ("TmBehindPct", |p| p.tm_behind_pct, |p, v| p.tm_behind_pct = v, 40, 100),
+    ("TmFloorMs", |p| p.tm_floor_ms, |p, v| p.tm_floor_ms = v, 1, 200),
 ];
 
 impl Params {
@@ -335,7 +440,7 @@ impl Default for Features {
             iir: true,
             lmp_improving: false,
             qs_futility: false,
-            tm_node_effort: false,
+            tm_node_effort: true,
             probcut: false,
             nmp_cut_node: false,
             rfp_damp: false,
@@ -378,14 +483,13 @@ impl Features {
     }
 
     /// The ones the reference does not have. All default off.
-    pub const EXTRA: [&'static str; 13] = [
+    pub const EXTRA: [&'static str; 12] = [
         "CorrHist",
         "Razoring",
         "Rule50Fade",
         "TtPvLmr",
         "LmpImproving",
         "QsFutility",
-        "TmNodeEffort",
         "Probcut",
         "NmpCutNode",
         "RfpDamp",
@@ -395,8 +499,8 @@ impl Features {
     ];
 
     /// The ones it does have, so they are in the baseline. All default on.
-    pub const BASELINE: [&'static str; 5] =
-        ["CutNodeLmr", "HistoryPrune", "LmrCaptures", "TmStability", "IIR"];
+    pub const BASELINE: [&'static str; 6] =
+        ["CutNodeLmr", "HistoryPrune", "LmrCaptures", "TmStability", "IIR", "TmNodeEffort"];
 }
 
 #[derive(Default, Clone)]
@@ -437,7 +541,8 @@ pub struct Searcher {
     killers: [[Option<Move>; NUM_KILLERS]; MAX_PLY],
     history: [[[i32; 64]; 64]; 2],
     /// `[side][pawn structure]`.
-    corr: Vec<[i32; CORR_SIZE]>,
+    /// `[kind][side][key]`.
+    corr: Vec<Vec<[i32; CORR_SIZE]>>,
     /// What was played at each ply, as (piece, destination). Continuation
     /// history is indexed by this: a move is good or bad largely in reply to
     /// something, and a table that ignores what came before cannot say which.
@@ -584,7 +689,7 @@ impl Searcher {
             stopped: false,
             killers: [[None; NUM_KILLERS]; MAX_PLY],
             history: [[[0; 64]; 64]; 2],
-            corr: vec![[0; CORR_SIZE]; 2],
+            corr: vec![vec![[0; CORR_SIZE]; 2]; CORR_KINDS],
             played: [None; MAX_PLY],
             conthist: vec![vec![[[0; 64]; 6]; 6 * 64]; CONT_SLOTS],
             capthist: vec![[[0; 6]; 64]; 6],
@@ -614,7 +719,7 @@ impl Searcher {
         self.tt.clear();
         self.killers = [[None; NUM_KILLERS]; MAX_PLY];
         self.history = [[[0; 64]; 64]; 2];
-        self.corr = vec![[0; CORR_SIZE]; 2];
+        self.corr = vec![vec![[0; CORR_SIZE]; 2]; CORR_KINDS];
         self.conthist = vec![vec![[[0; 64]; 6]; 6 * 64]; CONT_SLOTS];
         self.capthist = vec![[[0; 6]; 64]; 6];
     }
@@ -622,19 +727,34 @@ impl Searcher {
     /// The static score, adjusted by what the search has been saying about
     /// positions with this pawn structure.
     #[inline]
-    fn corrected(&self, board: &Board, raw: i32) -> i32 {
-        let c = self.corr[board.side.idx()][corr_index(board)] / CORR_GRAIN;
+    fn corrected(&self, board: &Board, raw: i32, ply: usize) -> i32 {
+        let last = if ply > 0 { self.played[ply - 1] } else { None };
+        let idx = corr_indices(board, last);
+        let side = board.side.idx();
+        // The average of what each reading has to say, not their sum: five
+        // tables that agree should move the score as far as one, not five
+        // times as far.
+        let mut total = 0i32;
+        for k in 0..CORR_KINDS {
+            total += self.corr[k][side][idx[k]];
+        }
+        let c = total / (CORR_KINDS as i32 * CORR_GRAIN);
         (raw + c).clamp(-MATE_IN_MAX + 1, MATE_IN_MAX - 1)
     }
 
     /// Learn from the difference, weighted by how deep the search that found
     /// it went.
     #[inline]
-    fn learn_correction(&mut self, board: &Board, diff: i32, depth: i32) {
-        let e = &mut self.corr[board.side.idx()][corr_index(board)];
+    fn learn_correction(&mut self, board: &Board, diff: i32, depth: i32, ply: usize) {
+        let last = if ply > 0 { self.played[ply - 1] } else { None };
+        let idx = corr_indices(board, last);
+        let side = board.side.idx();
         let target = (diff * CORR_GRAIN).clamp(-CORR_MAX, CORR_MAX);
         let w = (depth + 1).min(16);
-        *e = ((*e * (256 - w) + target * w) / 256).clamp(-CORR_MAX, CORR_MAX);
+        for k in 0..CORR_KINDS {
+            let e = &mut self.corr[k][side][idx[k]];
+            *e = ((*e * (256 - w) + target * w) / 256).clamp(-CORR_MAX, CORR_MAX);
+        }
     }
 
     /// Which continuation table each slot points at, this ply.
@@ -666,7 +786,8 @@ impl Searcher {
     ///
     /// Everything is taken from the clock AFTER the overhead is removed, and
     /// `hard` is capped so that even the wall cannot spend what we do not have.
-    fn allocate(&mut self, limits: &Limits, side: Color) {
+    fn allocate(&mut self, limits: &Limits, board: &Board) {
+        let side = board.side;
         self.start = Instant::now();
 
         if limits.infinite || limits.depth.is_some() || limits.nodes.is_some() {
@@ -682,9 +803,9 @@ impl Searcher {
             return;
         }
 
-        let (time, inc) = match side {
-            Color::White => (limits.wtime, limits.winc),
-            Color::Black => (limits.btime, limits.binc),
+        let (time, inc, opp_time) = match side {
+            Color::White => (limits.wtime, limits.winc, limits.btime),
+            Color::Black => (limits.btime, limits.binc, limits.wtime),
         };
         let time = match time {
             Some(t) => t,
@@ -710,7 +831,49 @@ impl Searcher {
         // The increment is income, so most of it can be spent every move
         // without the clock moving. Not all of it: the part held back is what
         // slowly rebuilds a buffer over a long game.
-        let base = usable / mtg + inc * self.params.tm_inc_pct as u64 / 100;
+        let mut base = usable / mtg + inc * self.params.tm_inc_pct as u64 / 100;
+
+        // What the position is worth spending on, by where the game is.
+        //
+        // The opening is played rather than calculated: the answer is either
+        // known or is one of several equally playable moves, and a quarter of
+        // a clock can disappear before the game has started. A simplified
+        // position has less left to find. The middle is where thinking pays,
+        // so that is where the money goes.
+        let ply = (board.fullmove as i32 - 1) * 2 + (side == Color::Black) as i32;
+        let pieces = board.occ_all.count_ones() as i32;
+        let phase = if ply < 12 {
+            self.params.tm_open_pct
+        } else if ply < 24 {
+            self.params.tm_early_pct
+        } else if ply < 45 {
+            self.params.tm_mid_pct
+        } else if ply < 65 {
+            self.params.tm_late_pct
+        } else if pieces <= 10 {
+            self.params.tm_simple_pct
+        } else {
+            100
+        };
+        base = base * phase as u64 / 100;
+
+        // And by the other clock, which is half of the game.
+        //
+        // A comfortable lead on the clock is an asset to spend; being behind on
+        // it is a reason not to, because the opponent can simply keep playing
+        // and let the difference do the work. Overall health rather than the
+        // pace of any one move.
+        if let Some(opp) = opp_time.filter(|t| *t > 0) {
+            let ratio = time * 10 / opp;
+            let pressure = if ratio > 15 {
+                self.params.tm_ahead_pct
+            } else if ratio < 7 {
+                self.params.tm_behind_pct
+            } else {
+                100
+            };
+            base = base * pressure as u64 / 100;
+        }
 
         // Two ceilings on the wall, and the second is the one that matters.
         //
@@ -719,7 +882,13 @@ impl Searcher {
         // clock.
         let hard = (base * self.params.tm_hard_mult as u64)
             .min(usable * self.params.tm_hard_pct as u64 / 100);
-        let soft = base.min(hard);
+        // A floor under both, so that a clock this low still buys a move that
+        // was looked at rather than one that was guessed. It cannot make the
+        // engine spend what it does not have: the floor is itself capped by
+        // what is actually left.
+        let floor = (self.params.tm_floor_ms as u64).min(usable);
+        let soft = base.min(hard).max(floor);
+        let hard = hard.max(soft);
 
         self.soft = Duration::from_millis(soft.max(1));
         self.hard = Duration::from_millis(hard.max(1));
@@ -766,7 +935,7 @@ impl Searcher {
     }
 
     pub fn go(&mut self, board: &mut Board, limits: &Limits, info: bool) -> Option<Move> {
-        self.allocate(limits, board.side);
+        self.allocate(limits, board);
         self.nodes = 0;
         self.stopped = false;
         self.stop.store(false, Ordering::Relaxed);
@@ -831,37 +1000,38 @@ impl Searcher {
                 iters_since_change += 1;
             }
 
-            let mut factor = 1.0f64;
-            if self.features.tm_stability {
-                // Falling score. The divisor is in the units the network
-                // speaks, where two are a centipawn, so a hundred of them is
-                // half a pawn -- the point at which a drop is worth real time.
-                let fall = 1.0 + (average_score - score) as f64 / 100.0;
-                factor *= fall.clamp(1.0, 1.75);
-
-                let d = (2.0 * depth as f64).max(1.0);
-                let steady = (1.0 - iters_since_change as f64 / d).clamp(0.75, 1.0);
-                let restless = (0.9 + best_move_changes as f64 / d).clamp(1.0, 1.5);
-                factor *= steady * restless;
-            }
-            if self.features.tm_node_effort {
-                let spent: u64 = self.root_effort.iter().map(|(_, n)| *n).sum();
-                let on_best = best
-                    .and_then(|b| self.root_effort.iter().find(|(m, _)| *m == b))
-                    .map(|(_, n)| *n)
-                    .unwrap_or(0);
-                if spent > 0 {
-                    // All of the tree on one move means nothing else was even
-                    // close; an even split means the position is genuinely
-                    // unclear and worth more time.
-                    let share = on_best as f64 / spent as f64;
-                    factor *= (1.6 - share).clamp(0.6, 1.3);
-                }
-            }
+            let spent: u64 = self.root_effort.iter().map(|(_, n)| *n).sum();
+            let on_best = best
+                .and_then(|b| self.root_effort.iter().find(|(m, _)| *m == b))
+                .map(|(_, n)| *n)
+                .unwrap_or(0);
+            // With nothing measured yet, claim the middle rather than either
+            // end: an unknown share should neither buy time nor spend it.
+            let effort_frac = if spent > 0 && self.features.tm_node_effort {
+                on_best as f64 / spent as f64
+            } else {
+                0.4
+            };
+            let drop = if self.features.tm_stability {
+                (average_score - score).max(0)
+            } else {
+                0
+            };
+            let settle = if self.features.tm_stability {
+                iters_since_change as u32
+            } else {
+                0
+            };
+            let changes = if self.features.tm_stability {
+                best_move_changes.max(0) as u32
+            } else {
+                0
+            };
+            let factor = time_scale(effort_frac, settle, drop, changes);
 
             // The scaling moves the plan, never the wall. Whatever the position
             // says, a move cannot spend more than the clock allows.
-            let soft = base_soft.mul_f64(factor.clamp(0.4, 2.0)).min(self.hard);
+            let soft = base_soft.mul_f64(factor).min(self.hard);
             self.soft = soft;
 
             // Is there room for another iteration, not is there room for the
@@ -1099,7 +1269,7 @@ impl Searcher {
         let static_eval = if in_check || !self.features.corr_hist {
             static_eval
         } else {
-            self.corrected(board, static_eval)
+            self.corrected(board, static_eval, ply)
         };
 
         self.eval_stack[ply] = static_eval;
@@ -1623,7 +1793,7 @@ impl Searcher {
             && ((best_score < static_eval && best_score < beta)
                 || (best_score > static_eval && best_move.is_some()))
         {
-            self.learn_correction(board, best_score - static_eval, depth);
+            self.learn_correction(board, best_score - static_eval, depth, ply);
         }
 
         let bound = if best_score >= beta {
