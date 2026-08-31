@@ -442,7 +442,6 @@ impl Searcher {
             return self.quiescence_ref(board, alpha, beta, ply);
         }
 
-        self.nodes += 1;
         if self.out_of_time() {
             return 0;
         }
@@ -551,6 +550,7 @@ impl Searcher {
         {
             let r = 4 + ((static_eval - beta) / 200).min(6);
             let nd = (depth - r).max(0);
+            self.nodes += 1;
             let undo = board.make_null_move();
             self.keys.push(board.hash);
             self.null_at[ply] = true;
@@ -662,6 +662,7 @@ impl Searcher {
                 }
             }
 
+            self.nodes += 1;
             let piece = board.piece_at(mv.from).map(|(pt, _)| pt.idx()).unwrap_or(0);
             let capture_or_promo = mv.is_capture() || mv.promotion.is_some();
             self.played_moves[ply] = Some(mv);
@@ -783,7 +784,6 @@ impl Searcher {
 
     /// Quiescence, transcribed alongside it.
     pub fn quiescence_ref(&mut self, board: &mut Board, mut alpha: i32, beta: i32, ply: usize) -> i32 {
-        self.nodes += 1;
         if self.out_of_time() {
             return 0;
         }
@@ -866,6 +866,7 @@ impl Searcher {
             if !in_check && !crate::see::see_ge(&self.atk, board, &mv, 0) {
                 continue;
             }
+            self.nodes += 1;
             self.played_moves[ply] = Some(mv);
             let undo = board.make_move(&mv);
             self.tt.prefetch(board.hash);
