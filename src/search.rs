@@ -72,6 +72,11 @@ fn corr_index(board: &Board) -> usize {
 }
 
 /// How many continuation tables, and how far back each looks.
+/// Quiet moves remembered per ply as having caused a cutoff. Three rather
+/// than two: the extra one costs a comparison and catches the case where two
+/// different refutations alternate, which two slots lose to immediately.
+pub const NUM_KILLERS: usize = 3;
+
 pub const CONT_SLOTS: usize = 3;
 pub const CONT_BACK: [usize; CONT_SLOTS] = [1, 2, 4];
 /// Weight per slot when scoring, the reply carrying twice the rest.
@@ -420,7 +425,7 @@ pub struct Searcher {
     hard: Duration,
     stopped: bool,
 
-    killers: [[Option<Move>; 2]; MAX_PLY],
+    killers: [[Option<Move>; NUM_KILLERS]; MAX_PLY],
     history: [[[i32; 64]; 64]; 2],
     /// `[side][pawn structure]`.
     corr: Vec<[i32; CORR_SIZE]>,
@@ -560,7 +565,7 @@ impl Searcher {
             soft: Duration::from_secs(0),
             hard: Duration::from_secs(0),
             stopped: false,
-            killers: [[None; 2]; MAX_PLY],
+            killers: [[None; NUM_KILLERS]; MAX_PLY],
             history: [[[0; 64]; 64]; 2],
             corr: vec![[0; CORR_SIZE]; 2],
             played: [None; MAX_PLY],
@@ -589,7 +594,7 @@ impl Searcher {
 
     pub fn clear(&mut self) {
         self.tt.clear();
-        self.killers = [[None; 2]; MAX_PLY];
+        self.killers = [[None; NUM_KILLERS]; MAX_PLY];
         self.history = [[[0; 64]; 64]; 2];
         self.corr = vec![[0; CORR_SIZE]; 2];
         self.conthist = vec![vec![[[0; 64]; 6]; 6 * 64]; CONT_SLOTS];
@@ -1007,7 +1012,15 @@ impl Searcher {
             }
         }
 
-        let static_eval = if in_check {
+        // The raw number is kept separately, because it is what goes back into
+        // the table at the bottom of this node.
+        //
+        // Storing the corrected value there instead is a quiet disaster: the
+        // next visit reads it, applies the correction a second time, stores
+        // that, and the error compounds every time the position is reached.
+        // Nothing about it looks wrong from outside -- the evaluation stays
+        // plausible while drifting.
+        let raw_static_eval = if in_check {
             TT_EVAL_NONE as i32
         } else {
             match entry {
@@ -1019,6 +1032,7 @@ impl Searcher {
                 }
             }
         };
+        let static_eval = raw_static_eval;
         // The table keeps the raw number, the search uses the corrected one.
         // Deliberately different: the table is shared, and whoever reads it
         // later applies their own correction.
@@ -1190,7 +1204,7 @@ impl Searcher {
         if moves.is_empty() {
             return if in_check { mate_score(ply) } else { 0 };
         }
-        let mut scores = self.score_moves(board, &moves, tt_move, ply);
+        let (mut scores, mut hist) = self.score_moves(board, &moves, tt_move, ply, depth);
 
         let mut best_score = -INF;
         let mut best_move = None;
@@ -1202,7 +1216,7 @@ impl Searcher {
             .map(|e| score_from_tt(e.score, ply));
 
         for i in 0..moves.len() {
-            Self::pick(&mut moves, &mut scores, i);
+            Self::pick(&mut moves, &mut scores, &mut hist, i);
             let mv = moves[i];
             if Some(mv) == excluded {
                 continue;
@@ -1299,12 +1313,12 @@ impl Searcher {
                     // less than the margin suggests. Its divisor is in OUR
                     // history units, which run about five and a half times
                     // smaller.
-                    let hist = scores[i] / self.params.fut_hist_div.max(1);
+                    let hist_term = hist[i] / self.params.fut_hist_div.max(1);
                     if depth <= self.params.fut_depth
                         && static_eval
                             + self.params.fut_base
                             + self.params.fut_slope * depth
-                            + hist
+                            + hist_term
                             <= alpha
                     {
                         break;
@@ -1323,7 +1337,7 @@ impl Searcher {
                     // outside.
                     if self.features.history_prune
                         && depth <= 4
-                        && scores[i] < -self.params.hist_prune * depth * depth
+                        && hist[i] < -self.params.hist_prune * depth * depth
                     {
                         continue;
                     }
@@ -1375,6 +1389,8 @@ impl Searcher {
 
             let new_depth = depth - 1 + extension;
 
+            let mut did_lmr = false;
+            let mut searched_again = false;
             let mut score;
             if i == 0 {
                 // The first move of a principal variation node leads to another
@@ -1395,6 +1411,7 @@ impl Searcher {
                 let reducible = is_quiet
                     || (self.features.lmr_captures && !pv_node && depth >= 3);
 
+                did_lmr = true;
                 let mut r = 0;
                 if depth >= 3 && reducible && !in_check {
                     // Accumulated in 1024ths and divided at the end, so a term
@@ -1423,7 +1440,7 @@ impl Searcher {
                     }
                     // A move the history likes gets the benefit of the doubt,
                     // one it dislikes gets less of it.
-                    r1024 -= (scores[i] * 1024 / self.params.lmr_hist_div.max(1))
+                    r1024 -= (hist[i] * 1024 / self.params.lmr_hist_div.max(1))
                         .clamp(-2048, 2048);
                     r = (r1024 / 1024).clamp(0, (new_depth - 1).max(0));
                 }
@@ -1432,6 +1449,7 @@ impl Searcher {
                 score =
                     -self.negamax(board, new_depth - r, -alpha - 1, -alpha, ply + 1, false, true);
                 if score > alpha && r > 0 {
+                    searched_again = true;
                     score = -self.negamax(
                         board,
                         new_depth,
@@ -1452,6 +1470,22 @@ impl Searcher {
 
             if root {
                 self.root_effort.push((mv, self.nodes - nodes_before));
+            }
+
+            // A quiet move that was reduced and then had to be searched again
+            // has told us something either way: it was worth the second look,
+            // or it was not. Both are worth recording, and neither shows up in
+            // the cutoff update, which only ever sees the move that ended the
+            // node.
+            if did_lmr && searched_again && is_quiet {
+                let credit = if score > best_score {
+                    hist_bonus(depth)
+                } else {
+                    -hist_bonus(depth)
+                };
+                let side = board.side.idx();
+                let slots = self.cont_slots(ply);
+                self.credit(board, mv, side, &slots, credit);
             }
 
             if self.stopped {
@@ -1525,7 +1559,7 @@ impl Searcher {
         let se = if in_check {
             TT_EVAL_NONE
         } else {
-            static_eval as i16
+            raw_static_eval as i16
         };
         if excluded.is_none() {
             self.tt.store(
@@ -1603,13 +1637,14 @@ impl Searcher {
         if in_check && moves.is_empty() {
             return mate_score(ply);
         }
-        let mut scores = self.score_moves(board, &moves, tt_move, ply);
+        let (mut scores, _) = self.score_moves(board, &moves, tt_move, ply, 1);
 
         let mut best = if in_check { -INF } else { static_eval };
         let mut best_move = None;
 
+        let mut hist_unused: Vec<i32> = vec![0; moves.len()];
         for i in 0..moves.len() {
-            Self::pick(&mut moves, &mut scores, i);
+            Self::pick(&mut moves, &mut scores, &mut hist_unused, i);
             let mv = moves[i];
 
             // A capture that loses material cannot raise the floor we are
@@ -1706,8 +1741,10 @@ impl Searcher {
         depth: i32,
         searched: &[Move],
     ) {
-        if self.killers[ply][0] != Some(mv) {
-            self.killers[ply][1] = self.killers[ply][0];
+        if !self.killers[ply].iter().any(|k| *k == Some(mv)) {
+            for i in (1..NUM_KILLERS).rev() {
+                self.killers[ply][i] = self.killers[ply][i - 1];
+            }
             self.killers[ply][0] = Some(mv);
         }
         let side = board.side.idx();
@@ -1759,15 +1796,46 @@ impl Searcher {
         moves: &[Move],
         tt_move: Option<Move>,
         ply: usize,
-    ) -> Vec<i32> {
+        depth: i32,
+    ) -> (Vec<i32>, Vec<i32>) {
         let side = board.side.idx();
         // Hoisted: the continuation slots depend on the ply, not on the move,
         // and looking them up per move turned a couple of array reads into a
         // couple per move in the hottest loop there is.
         let slots = self.cont_slots(ply);
-        moves
+
+        // What the tables actually think of each move, kept apart from where it
+        // goes in the list.
+        //
+        // These were the same number, and it was wrong. Ordering uses large
+        // sentinels -- a million for the table move, four hundred thousand for
+        // a killer, plus or minus six hundred thousand for a capture -- so any
+        // reduction scaled by "the score" saturated on the sentinel and had
+        // nothing to do with history at all. Every killer and table move was
+        // being reduced two plies less, and every losing capture two plies
+        // more, on the strength of a tag rather than a fact.
+        let hist: Vec<i32> = moves
             .iter()
             .map(|mv| {
+                if mv.is_capture() || mv.promotion.is_some() {
+                    return 0;
+                }
+                let mut h = self.history[side][mv.from as usize][mv.to as usize];
+                if let Some(pc) = board.piece_at(mv.from).map(|(pt, _)| pt.idx()) {
+                    for (k, slot) in slots.iter().enumerate() {
+                        if let Some(idx) = slot {
+                            h += CONT_WEIGHT[k] * self.conthist[k][*idx][pc][mv.to as usize];
+                        }
+                    }
+                }
+                h
+            })
+            .collect();
+
+        let order = moves
+            .iter()
+            .enumerate()
+            .map(|(n, mv)| {
                 if Some(*mv) == tt_move {
                     1_000_000
                 } else if mv.is_capture() {
@@ -1789,36 +1857,35 @@ impl Searcher {
                     // moves on the strength of what it takes is how a search
                     // spends its first three tries on refuted sacrifices.
                     // Below everything, then, but still ahead of nothing.
-                    if see::see_ge(&self.atk, board, mv, 0) {
+                    // The bar for a capture counting as good drops with depth.
+                    // Deep in the tree there is room to find out whether a
+                    // capture that looks slightly losing actually is; near the
+                    // leaves there is not, so only the clearly good ones go
+                    // first.
+                    let bar = (-50 * (depth - 1)).max(-250);
+                    if see::see_ge(&self.atk, board, mv, bar) {
                         600_000 + mvv
                     } else {
                         -600_000 + mvv
                     }
                 } else if mv.promotion == Some(PieceType::Queen) {
                     500_000
-                } else if Some(*mv) == self.killers[ply][0] {
-                    400_000
-                } else if Some(*mv) == self.killers[ply][1] {
-                    390_000
+                } else if let Some(k) =
+                    self.killers[ply].iter().position(|k| *k == Some(*mv))
+                {
+                    400_000 - 10_000 * k as i32
                 } else {
-                    let mut h = self.history[side][mv.from as usize][mv.to as usize];
-                    if let Some(pc) = board.piece_at(mv.from).map(|(pt, _)| pt.idx()) {
-                        for (k, slot) in slots.iter().enumerate() {
-                            if let Some(idx) = slot {
-                                h += CONT_WEIGHT[k]
-                                    * self.conthist[k][*idx][pc][mv.to as usize];
-                            }
-                        }
-                    }
-                    h
+                    hist[n]
                 }
             })
-            .collect()
+            .collect();
+
+        (order, hist)
     }
 
     /// Bring the best remaining move to `at`, keeping scores in step.
     #[inline]
-    fn pick(moves: &mut [Move], scores: &mut [i32], at: usize) {
+    fn pick(moves: &mut [Move], scores: &mut [i32], hist: &mut [i32], at: usize) {
         let mut best = at;
         for j in at + 1..moves.len() {
             if scores[j] > scores[best] {
@@ -1827,5 +1894,6 @@ impl Searcher {
         }
         moves.swap(at, best);
         scores.swap(at, best);
+        hist.swap(at, best);
     }
 }
