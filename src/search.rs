@@ -356,6 +356,16 @@ pub struct Params {
     /// time today a constant has been carried across a scale boundary, and the
     /// first two both silently disabled the thing they were meant to control.
     pub probcut_margin: i32,
+    /// What a capture is credited with beyond the piece it takes, before the
+    /// quiescence margin gives up on it.
+    ///
+    /// Two hundred is exactly one pawn here, and it got there by reading a
+    /// number off another engine without converting it: in the scale it came
+    /// from, the same test allows about a pawn and a half. Measured at one
+    /// pawn, this threw away 45% of the captures it looked at in a tactical
+    /// position -- a great deal for a search whose only job is not to miss
+    /// tactics -- and switching it on cost 63 Elo over a thousand games.
+    pub qs_margin: i32,
     pub tm_mtg: i32,
     /// percent of the increment spent each move
     pub tm_inc_pct: i32,
@@ -412,6 +422,7 @@ impl Default for Params {
             lmr_nonpv_f: 1024,
             lmr_ttpv_f: 1024,
             probcut_margin: 294,
+            qs_margin: 450,
             tm_mtg: 46,
             tm_inc_pct: 75,
             tm_hard_mult: 4,
@@ -463,6 +474,7 @@ pub const PARAM_SPECS: &[ParamSpec] = &[
     ("LmrNonPvF", |p| p.lmr_nonpv_f, |p, v| p.lmr_nonpv_f = v, 0, 2048),
     ("LmrTtPvF", |p| p.lmr_ttpv_f, |p, v| p.lmr_ttpv_f = v, 0, 2048),
     ("ProbcutMargin", |p| p.probcut_margin, |p, v| p.probcut_margin = v, 100, 1024),
+    ("QsMargin", |p| p.qs_margin, |p, v| p.qs_margin = v, 50, 900),
     ("TmMtg", |p| p.tm_mtg, |p, v| p.tm_mtg = v, 15, 70),
     ("TmIncPct", |p| p.tm_inc_pct, |p, v| p.tm_inc_pct = v, 20, 95),
     ("TmHardMult", |p| p.tm_hard_mult, |p, v| p.tm_hard_mult = v, 1, 8),
@@ -2332,7 +2344,7 @@ impl Searcher {
                     // score. Trying it the other way round was the first thing
                     // I changed here and it did not help, which was the clue
                     // that the fault was elsewhere.
-                    let futile = stand + value_in_eval_units(pt) + 200;
+                    let futile = stand + value_in_eval_units(pt) + self.params.qs_margin;
                     if stand != TT_EVAL_NONE as i32 && futile <= alpha {
                         // The value it could not beat is an honest lower bound
                         // on this node. The capture was not searched, but it was
