@@ -303,6 +303,8 @@ pub struct Features {
     pub rfp_damp: bool,
     /// Extend a move that gives check.
     pub check_ext: bool,
+    /// Credit the stored move when the table itself produces the cutoff.
+    pub tt_cut_credit: bool,
 
     /// Reduce harder at a node that is expected to fail high.
     ///
@@ -336,6 +338,7 @@ impl Default for Features {
             nmp_cut_node: false,
             rfp_damp: false,
             check_ext: false,
+            tt_cut_credit: false,
             cut_node_lmr: true,
             history_prune: true,
             tm_stability: true,
@@ -360,6 +363,7 @@ impl Features {
             "nmpcutnode" => self.nmp_cut_node = on,
             "rfpdamp" => self.rfp_damp = on,
             "checkext" => self.check_ext = on,
+            "ttcutcredit" => self.tt_cut_credit = on,
             "cutnodelmr" => self.cut_node_lmr = on,
             "historyprune" => self.history_prune = on,
             "tmstability" => self.tm_stability = on,
@@ -370,7 +374,7 @@ impl Features {
     }
 
     /// The ones the reference does not have. All default off.
-    pub const EXTRA: [&'static str; 11] = [
+    pub const EXTRA: [&'static str; 12] = [
         "CorrHist",
         "Razoring",
         "Rule50Fade",
@@ -382,6 +386,7 @@ impl Features {
         "NmpCutNode",
         "RfpDamp",
         "CheckExt",
+        "TtCutCredit",
     ];
 
     /// The ones it does have, so they are in the baseline. All default on.
@@ -1022,12 +1027,19 @@ impl Searcher {
                     // have produced, and returning without recording it lets
                     // the tables go cold in exactly the positions that come
                     // back most often -- the ones the table keeps answering.
-                    if s >= beta {
+                    if self.features.tt_cut_credit && s >= beta {
                         if let Some(m) = tt_move {
-                            if !m.is_capture()
-                                && m.promotion.is_none()
-                                && board.piece_at(m.from).is_some()
-                            {
+                            // As close to a legality test as is affordable here:
+                            // one of ours on the origin square, and nothing of
+                            // ours on the destination. It does not prove the
+                            // move is legal, which is why this is off.
+                            let ours = board
+                                .piece_at(m.from)
+                                .is_some_and(|(_, c)| c == board.side);
+                            let free = board
+                                .piece_at(m.to)
+                                .is_none_or(|(_, c)| c != board.side);
+                            if ours && free && !m.is_capture() && m.promotion.is_none() {
                                 let side = board.side.idx();
                                 let slots = self.cont_slots(ply);
                                 self.credit(board, m, side, &slots, hist_bonus(depth));
@@ -1654,6 +1666,7 @@ impl Searcher {
         // static score is a floor. Not while in check, where every move is
         // forced and there is nothing to stand on.
         let mut static_eval = TT_EVAL_NONE as i32;
+        let mut stand = TT_EVAL_NONE as i32;
         if !in_check {
             static_eval = match entry {
                 Some(e) if e.static_eval != TT_EVAL_NONE => e.static_eval as i32,
@@ -1687,7 +1700,8 @@ impl Searcher {
             if floor > alpha {
                 alpha = floor;
             }
-            static_eval = floor;
+            stand = floor;
+
         }
 
         let mut moves = if in_check {
@@ -1700,7 +1714,7 @@ impl Searcher {
         }
         let (mut scores, _) = self.score_moves(board, &moves, tt_move, ply, 1);
 
-        let mut best = if in_check { -INF } else { static_eval };
+        let mut best = if in_check { -INF } else { stand };
         let mut best_move = None;
 
         let mut hist_unused: Vec<i32> = vec![0; moves.len()];
@@ -1736,8 +1750,8 @@ impl Searcher {
                     .promotion
                     .map(|p| value_in_eval_units(p) - value_in_eval_units(PieceType::Pawn))
                     .unwrap_or(0);
-                if static_eval != TT_EVAL_NONE as i32
-                    && static_eval + taken + promo + 200 <= alpha
+                if stand != TT_EVAL_NONE as i32
+                    && stand + taken + promo + 200 <= alpha
                 {
                     continue;
                 }
