@@ -184,6 +184,7 @@ pub fn main_loop() {
                 // repetition is measured against. Losing the history here makes
                 // the search blind to a draw it is one move away from.
                 let mut keys = vec![board.hash];
+                let mut played: Vec<crate::moves::Move> = Vec::new();
                 if rest.get(i) == Some(&"moves") {
                     let atk = &searcher.atk;
                     for token in &rest[i + 1..] {
@@ -191,6 +192,7 @@ pub fn main_loop() {
                         if let Some(mv) = legal.iter().find(|m| m.to_uci() == *token) {
                             board.make_move(mv);
                             keys.push(board.hash);
+                            played.push(*mv);
                         } else {
                             eprintln!("info string illegal move in position: {}", token);
                             break;
@@ -198,6 +200,7 @@ pub fn main_loop() {
                     }
                 }
                 searcher.set_game_history(keys);
+                searcher.set_game_moves(&played);
             }
             "go" => {
                 let mut limits = Limits::default();

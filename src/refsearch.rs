@@ -124,13 +124,13 @@ impl Histories {
     /// `played` holds the move made at each ply. Offsets 0, 2 and 4 back from
     /// the current ply are what the reference reads.
     #[inline]
-    pub fn cont_slots(played: &[Option<Move>], ply: usize) -> [Option<usize>; NUM_CONTINUATION] {
+    pub fn cont_slots_from(
+        get: impl Fn(usize) -> Option<Move>,
+    ) -> [Option<usize>; NUM_CONTINUATION] {
         let mut out = [None; NUM_CONTINUATION];
         for (i, back) in [1usize, 3, 5].iter().enumerate() {
-            if ply >= *back {
-                if let Some(m) = played[ply - back] {
-                    out[i] = Some(m.from as usize * 64 + m.to as usize);
-                }
+            if let Some(m) = get(*back) {
+                out[i] = Some(m.from as usize * 64 + m.to as usize);
             }
         }
         out
@@ -466,7 +466,7 @@ impl Searcher {
             alpha = a;
         }
 
-        let slots = crate::refsearch::Histories::cont_slots(&self.played_moves, ply);
+        let slots = crate::refsearch::Histories::cont_slots_from(|b| self.move_back(ply, b));
 
         let entry = if excluded.is_some() {
             None
@@ -851,7 +851,7 @@ impl Searcher {
         }
 
         let legal = crate::movegen::generate_legal(board, &self.atk);
-        let slots = crate::refsearch::Histories::cont_slots(&self.played_moves, ply);
+        let slots = crate::refsearch::Histories::cont_slots_from(|b| self.move_back(ply, b));
         let mut picker = crate::refsearch::MoveOrder::new(tt_move, 0, true);
         picker.load(board, &legal);
 

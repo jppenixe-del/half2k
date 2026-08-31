@@ -182,6 +182,9 @@ fn time_scale(effort_frac: f64, settle: u32, score_drop: i32, changes: u32) -> f
     (effort * settle * falling * instability).clamp(0.65, 3.4)
 }
 
+/// How far above the root the continuation tables may reach into the game.
+pub const PRE_MOVES: usize = 6;
+
 pub const MAX_PLY: usize = 128;
 pub const INF: i32 = 32_000;
 pub const MATE: i32 = 31_000;
@@ -588,6 +591,8 @@ pub struct Searcher {
     /// The transcribed search keeps its own tables: same shapes and ceilings as
     /// the reference, which are not the shapes ours uses.
     pub(crate) ref_hist: crate::refsearch::Histories,
+    /// The last few moves of the game, for the plies above the root.
+    pub(crate) pre_moves: [Option<Move>; PRE_MOVES],
     /// How many nodes each root move cost this iteration. A move that took
     /// most of the tree and still came out best was not a close call, and time
     /// management can read that.
@@ -720,6 +725,7 @@ impl Searcher {
             excluded: [None; MAX_PLY],
             played_moves: vec![None; MAX_PLY],
             ref_hist: crate::refsearch::Histories::new(MAX_PLY),
+            pre_moves: [None; PRE_MOVES],
             root_effort: Vec::with_capacity(256),
             null_at: [false; MAX_PLY],
         }
@@ -734,6 +740,38 @@ impl Searcher {
     pub fn set_game_history(&mut self, keys: Vec<u64>) {
         self.keys = keys;
         self.root_keys = self.keys.len();
+    }
+
+    /// The moves actually played before this search started.
+    ///
+    /// Continuation history asks "what is a good reply to what just happened",
+    /// and at the top of the tree what just happened is in the GAME, not in the
+    /// search. Without this the tables are empty for the first plies of every
+    /// search -- which is where most of the tree is -- and the ordering there
+    /// runs on the butterfly table alone.
+    ///
+    /// Measured against the program this search was transcribed from: its
+    /// average history score per reduced move was -7757 against ours at -1219,
+    /// six times less opinionated, and this was why.
+    ///
+    /// Stored in the slots below zero, so that `ply - 1` at the root reaches
+    /// the last move of the game rather than nothing.
+    pub fn set_game_moves(&mut self, moves: &[Move]) {
+        self.pre_moves = [None; PRE_MOVES];
+        for (i, mv) in moves.iter().rev().take(PRE_MOVES).enumerate() {
+            self.pre_moves[i] = Some(*mv);
+        }
+    }
+
+    /// The move `back` plies before `ply`, reaching into the game when the
+    /// search runs out.
+    #[inline]
+    pub(crate) fn move_back(&self, ply: usize, back: usize) -> Option<Move> {
+        if ply >= back {
+            self.played_moves[ply - back]
+        } else {
+            self.pre_moves.get(back - ply - 1).copied().flatten()
+        }
     }
 
     pub fn clear(&mut self) {
@@ -793,6 +831,11 @@ impl Searcher {
                 if let Some((pc, to)) = self.played[ply - back] {
                     out[k] = Some(pc * 64 + to);
                 }
+            } else if let Some(mv) = self.pre_moves.get(back - ply - 1).copied().flatten() {
+                // Above the root: the piece is unknown here, so the move itself
+                // stands in for it. Consistent within the table, which is all
+                // an index has to be.
+                out[k] = Some((mv.from as usize % 6) * 64 + mv.to as usize);
             }
         }
         out
