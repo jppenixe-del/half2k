@@ -71,6 +71,7 @@ pub fn main_loop() {
                     searcher.move_overhead
                 );
                 println!("option name EvalFile type string default <empty>");
+                println!("option name SyzygyPath type string default <empty>");
                 // Off by default, every one of them: out of the box the search
                 // uses the smaller, settled set of ideas, so anything switched
                 // on has a number of its own rather than being lost in a pile
@@ -146,6 +147,14 @@ pub fn main_loop() {
                         "evalfile" => {
                             net_path = value;
                             net_loaded = false;
+                        }
+                        "syzygypath" => {
+                            let n = crate::tb::carregar(&value);
+                            if n > 0 {
+                                println!("info string tablebases up to {} pieces", n);
+                            } else {
+                                println!("info string no tablebases at {}", value);
+                            }
                         }
                         other => {
                             if let Ok(n) = value.parse::<i32>() {

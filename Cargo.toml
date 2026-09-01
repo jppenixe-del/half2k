@@ -5,6 +5,11 @@ edition = "2021"
 license = "GPL-3.0-or-later"
 
 [dependencies]
+# Syzygy probing in Rust rather than through the C library: no build script and
+# no shim to keep in step. The engine keeps its own board; the conversion to the
+# shape the prober wants happens at the probe and nowhere else.
+shakmaty = "0.30"
+shakmaty-syzygy = { version = "0.28", features = ["mmap"] }
 
 [profile.release]
 opt-level = 3

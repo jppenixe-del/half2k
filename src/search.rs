@@ -385,6 +385,8 @@ pub struct Params {
     /// position -- a great deal for a search whose only job is not to miss
     /// tactics -- and switching it on cost 63 Elo over a thousand games.
     pub qs_margin: i32,
+    /// Below this many pieces on the board, nothing is reduced at all.
+    pub lmr_endgame_pieces: i32,
     pub tm_mtg: i32,
     /// percent of the increment spent each move
     pub tm_inc_pct: i32,
@@ -443,6 +445,7 @@ impl Default for Params {
             probcut_margin: 294,
             tm_trend_window: 40,
             qs_margin: 450,
+            lmr_endgame_pieces: 0,
             tm_mtg: 46,
             tm_inc_pct: 75,
             tm_hard_mult: 4,
@@ -496,6 +499,8 @@ pub const PARAM_SPECS: &[ParamSpec] = &[
     ("ProbcutMargin", |p| p.probcut_margin, |p, v| p.probcut_margin = v, 100, 1024),
     ("TmTrendWindow", |p| p.tm_trend_window, |p, v| p.tm_trend_window = v, 5, 200),
     ("QsMargin", |p| p.qs_margin, |p, v| p.qs_margin = v, 50, 900),
+    ("LmrEndgamePieces", |p| p.lmr_endgame_pieces,
+     |p, v| p.lmr_endgame_pieces = v, 0, 12),
     ("TmMtg", |p| p.tm_mtg, |p, v| p.tm_mtg = v, 15, 70),
     ("TmIncPct", |p| p.tm_inc_pct, |p, v| p.tm_inc_pct = v, 20, 95),
     ("TmHardMult", |p| p.tm_hard_mult, |p, v| p.tm_hard_mult = v, 1, 8),
@@ -821,6 +826,8 @@ pub struct Searcher {
     /// most of the tree and still came out best was not a close call, and time
     /// management can read that.
     root_effort: Vec<(Move, u64)>,
+    /// How often the tables answered instead of the search.
+    pub tb_hits: u64,
     /// Every root move with what this iteration thought of it.
     ///
     /// Keeping only the best one leaves nothing to fall back on when the best
@@ -959,6 +966,7 @@ impl Searcher {
             ref_hist: crate::refsearch::Histories::new(MAX_PLY),
             pre_moves: [None; PRE_MOVES],
             root_effort: Vec::with_capacity(256),
+            tb_hits: 0,
             root_scores: Vec::with_capacity(256),
             null_at: [false; MAX_PLY],
         }
@@ -1311,8 +1319,32 @@ impl Searcher {
     }
 
     pub fn go(&mut self, board: &mut Board, limits: &Limits, info: bool) -> Option<Move> {
+        // If the tables have settled this position there is nothing to search
+        // for. They know who wins and in how many moves, and the move they give
+        // is the one that makes progress against the fifty move rule -- which a
+        // search maximising a score will not choose, because every move that
+        // keeps the win looks equally winning to it.
+        if !limits.infinite && limits.depth.is_none() {
+            if let Some((mv, wdl)) = crate::tb::melhor_jogada_raiz(board, &self.atk) {
+                if info {
+                    let cp = match wdl {
+                        crate::tb::Wdl::Ganha => MATE_IN_MAX - 1,
+                        crate::tb::Wdl::Perde => -(MATE_IN_MAX - 1),
+                        crate::tb::Wdl::Empata => 0,
+                    };
+                    println!(
+                        "info depth 1 seldepth 1 score cp {} nodes 1 nps 0 tbhits 1 time 0 pv {}",
+                        cp,
+                        mv.to_uci()
+                    );
+                }
+                return Some(mv);
+            }
+        }
+
         self.allocate(limits, board);
         self.nodes = 0;
+        self.tb_hits = 0;
         self.stopped = false;
         self.stop.store(false, Ordering::Relaxed);
         self.tt.increase_gen();
@@ -1597,6 +1629,44 @@ impl Searcher {
             }
             if ply >= MAX_PLY - 1 {
                 return evaluate(board, self.features.rule50_fade);
+            }
+
+            // Below the size the tables cover, the result is not an estimate.
+            // Returning it ends the subtree at once, and ends it with the right
+            // answer -- which is worth more than the nodes saved, because the
+            // endings the tables cover are the ones a network reads worst.
+            //
+            // The score is placed just inside the mate range so it outranks any
+            // evaluation without ever being mistaken for a real mate, and the
+            // distance to the root keeps a shorter win preferred to a longer
+            // one even though the tables here cannot say how long either is.
+            if let Some(w) = crate::tb::sondar(board) {
+                match w {
+                    // A drawn table position is settled and can be returned
+                    // whatever else is loaded: there is no progress to measure
+                    // in a draw, so nothing is lost by not knowing the distance.
+                    crate::tb::Wdl::Empata => {
+                        self.tb_hits += 1;
+                        return self.draw_score(ply);
+                    }
+                    // A won one is only useful when the set can say how long
+                    // the win takes. Told merely that it is won, every move
+                    // that keeps it scores the same, the search has nothing to
+                    // choose between them, and a rook up becomes a draw by the
+                    // fifty move rule. Measured: king and rook against king
+                    // went from a1a6, which restricts the king, to e1e2, which
+                    // does nothing at all.
+                    _ if crate::tb::tem_dtz() => {
+                        self.tb_hits += 1;
+                        let v = if w == crate::tb::Wdl::Ganha {
+                            MATE_IN_MAX - 2 - ply as i32
+                        } else {
+                            -(MATE_IN_MAX - 2 - ply as i32)
+                        };
+                        return v;
+                    }
+                    _ => {}
+                }
             }
             // Mate distance pruning: no line from here can beat a mate already
             // found closer to the root.
@@ -2100,8 +2170,30 @@ impl Searcher {
                 // already at the front of the list, and the ones down here have
                 // been sorted below quiet moves by static exchange for a
                 // reason.
-                let reducible = is_quiet
-                    || (self.features.lmr_captures && !pv_node && depth >= 3);
+                // Nothing is reduced once the board is nearly empty.
+                //
+                // Off by default, and the reason is worth writing down because
+                // the idea sounded right and the measurement said otherwise.
+                // It was put in to fix a real fault: king and rook against
+                // king, four seconds, and the engine reports five and a half
+                // pawns rather than the mate. Switching reductions off in that
+                // position took the depth from nineteen to thirteen and left
+                // the score where it was.
+                //
+                // Which located the fault somewhere else. That mate is up to
+                // sixteen moves away -- thirty-two plies -- and no depth this
+                // search reaches can prove it. The engine would have to be
+                // driven there by the evaluation, and the network gives it the
+                // value of a rook without distinguishing a king pinned to the
+                // edge from one standing in the middle. It is an evaluation
+                // that cannot restrict a king, not a search that reduces the
+                // move which would. Tablebases are the answer to that, which is
+                // why every strong engine carries them for these endings.
+                let poucas_pecas =
+                    board.occ_all.count_ones() <= self.params.lmr_endgame_pieces as u32;
+                let reducible = !poucas_pecas
+                    && (is_quiet
+                        || (self.features.lmr_captures && !pv_node && depth >= 3));
 
                 did_lmr = true;
                 let mut r = 0;

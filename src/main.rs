@@ -20,6 +20,7 @@ mod ordered_movegen;
 mod perft;
 mod refsearch;
 mod search;
+mod tb;
 mod see;
 mod tt;
 mod types;
