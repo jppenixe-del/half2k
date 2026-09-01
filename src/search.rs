@@ -621,7 +621,9 @@ impl Default for Features {
             qs_futility: false,
             tm_node_effort: true,
             probcut: false,
-            nmp_cut_node: false,
+            // On by default since 2026-09-01: 1015 games at 16+0.16,
+            // +5.8 Elo either way of 21.
+            nmp_cut_node: true,
             // On by default since 2026-09-01: 1000 games at 16+0.16, +10.8 Elo
             // either way of 22. Not proof, and not negative, which is the bar.
             rfp_damp: true,
@@ -668,14 +670,13 @@ impl Features {
     }
 
     /// The ones outside the settled set. All default off.
-    pub const EXTRA: [&'static str; 12] = [
+    pub const EXTRA: [&'static str; 11] = [
         "Razoring",
         "Rule50Fade",
         "TtPvLmr",
         "LmpImproving",
         "QsFutility",
         "Probcut",
-        "NmpCutNode",
         "CheckExt",
         "TtCutCredit",
         "CaptureHist",
@@ -684,9 +685,9 @@ impl Features {
     ];
 
     /// The ones it does have, so they are in the baseline. All default on.
-    pub const BASELINE: [&'static str; 8] =
+    pub const BASELINE: [&'static str; 9] =
         ["CutNodeLmr", "HistoryPrune", "LmrCaptures", "TmStability", "IIR", "TmNodeEffort",
-     "CorrHist", "RfpDamp"];
+     "CorrHist", "RfpDamp", "NmpCutNode"];
 }
 
 #[derive(Default, Clone)]
