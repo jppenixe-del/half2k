@@ -644,7 +644,16 @@ impl Default for Features {
             cut_node_lmr: false,
             history_prune: true,
             tm_stability: true,
-            lmr_captures: true,
+            // Off since 2026-09-01. Switching it OFF measured +9.6 Elo over
+            // 1009 games at 16+0.16, the second of two reduction extras to
+            // fail the same way -- reducing harder at cut nodes cost 6.5.
+            //
+            // Two independent measurements saying the same thing is worth
+            // more than either: the reduction here is already too deep, and
+            // anything that deepens it takes. Which fits what the game
+            // records were saying about conversion -- winning positions
+            // drawn rather than finished.
+            lmr_captures: false,
         }
     }
 }
@@ -679,8 +688,9 @@ impl Features {
     }
 
     /// The ones outside the settled set. All default off.
-    pub const EXTRA: [&'static str; 12] = [
+    pub const EXTRA: [&'static str; 13] = [
         "CutNodeLmr",
+        "LmrCaptures",
         "Razoring",
         "Rule50Fade",
         "TtPvLmr",
@@ -695,8 +705,8 @@ impl Features {
     ];
 
     /// The ones it does have, so they are in the baseline. All default on.
-    pub const BASELINE: [&'static str; 8] =
-        ["HistoryPrune", "LmrCaptures", "TmStability", "IIR", "TmNodeEffort",
+    pub const BASELINE: [&'static str; 7] =
+        ["HistoryPrune", "TmStability", "IIR", "TmNodeEffort",
      "CorrHist", "RfpDamp", "NmpCutNode"];
 }
 
