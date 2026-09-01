@@ -223,7 +223,6 @@ pub fn main_loop() {
                 }
                 let best = searcher.go(&mut board, &limits, true);
                 if std::env::var_os("HALF2K_DBG").is_some() {
-                    eprintln!("{}", crate::refsearch::dbg_report());
                 }
                 match best {
                     Some(m) => println!("bestmove {}", m.to_uci()),

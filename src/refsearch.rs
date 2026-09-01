@@ -424,45 +424,6 @@ use crate::search::{
 };
 use crate::tt::{Bound, TT_EVAL_NONE};
 
-
-// ---------------------------------------------------------------------------
-// Decision counters.
-//
-// Two searches can follow the same rules, hold the same constants and still
-// walk different trees, and none of that shows up in the score -- only in
-// which rule fired how often. A count at every decision point turns "it plays
-// worse" into "this test fired six times where it should fire eleven", which
-// is a question with an answer.
-//
-// Silent unless HALF2K_DBG is set in the environment. A relaxed add is not
-// something a search this size can measure.
-// ---------------------------------------------------------------------------
-
-pub const DBG_NAMES: [&str; 13] = [
-    "nodes", "qnodes", "ttcut", "rfp", "nmp", "movecount", "histprune",
-    "see_cap", "see_quiet", "lmr", "research", "rfp_try", "improving",
-];
-
-pub static DBG: [std::sync::atomic::AtomicU64; 13] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 13];
-
-#[inline(always)]
-pub fn dbg(i: usize) {
-    DBG[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-}
-
-pub fn dbg_report() -> String {
-    let mut s = String::from("DBG");
-    for (i, n) in DBG_NAMES.iter().enumerate() {
-        s.push_str(&format!(
-            " {}={}",
-            n,
-            DBG[i].load(std::sync::atomic::Ordering::Relaxed)
-        ));
-    }
-    s
-}
-
 impl Searcher {
     /// One node of the transcribed search.
     pub fn negamax_ref(
@@ -491,7 +452,7 @@ impl Searcher {
 
         if !root {
             if self.is_draw(board) {
-                return self.draw_score(ply);
+                return 0;
             }
             if ply >= MAX_PLY - 1 {
                 return crate::search::debug_eval(board, false);
@@ -566,17 +527,12 @@ impl Searcher {
             && ply >= 2
             && self.eval_stack[ply - 2] != TT_EVAL_NONE as i32
             && raw > self.eval_stack[ply - 2];
-        if improving {
-            dbg(12);
-        }
 
         // Reverse futility.
         if !pv_node && depth < 9 && !in_check && excluded.is_none() && static_eval.abs() < MATE_IN_MAX
         {
-            dbg(11);
             let margin = 150 * (depth - improving as i32);
             if static_eval - margin >= beta {
-                dbg(3);
                 return static_eval;
             }
         }
@@ -603,7 +559,6 @@ impl Searcher {
             self.keys.pop();
             board.unmake_null_move(&undo);
             if score >= beta {
-                dbg(4);
                 return if is_mate(score) { beta } else { score };
             }
         }
@@ -617,7 +572,7 @@ impl Searcher {
             return self.quiescence_ref(board, alpha, beta, ply);
         }
 
-        let legal = crate::ordered_movegen::generate(board, &self.atk, crate::ordered_movegen::GEN_LEGAL);
+        let legal = crate::movegen::generate_legal(board, &self.atk);
         let mut picker = crate::refsearch::MoveOrder::new(tt_move, depth, false);
         picker.load(board, &legal);
 
@@ -650,16 +605,13 @@ impl Searcher {
             {
                 if mv.is_capture() || mv.promotion.is_some() {
                     if depth < 10 && !crate::see::see_ge(&self.atk, board, &mv, -140 * depth) {
-                        dbg(7);
                         continue;
                     }
                 } else {
                     if depth < 7 && n_moves > 3 + depth * depth {
-                        dbg(5);
                         continue;
                     }
                     if move_score < -600 * depth * depth {
-                        dbg(6);
                         continue;
                     }
                     if !in_check
@@ -677,7 +629,6 @@ impl Searcher {
                             -10 * (depth + depth * depth),
                         )
                     {
-                        dbg(8);
                         continue;
                     }
                 }
@@ -840,7 +791,7 @@ impl Searcher {
             return crate::search::debug_eval(board, false);
         }
         if self.is_draw(board) {
-            return self.draw_score(ply);
+            return 0;
         }
         let in_check = board.in_check(board.side, &self.atk);
         let a = alpha.max(-crate::search::MATE + ply as i32);
@@ -899,7 +850,7 @@ impl Searcher {
             }
         }
 
-        let legal = crate::ordered_movegen::generate(board, &self.atk, crate::ordered_movegen::GEN_LEGAL);
+        let legal = crate::movegen::generate_legal(board, &self.atk);
         let slots = crate::refsearch::Histories::cont_slots_from(|b| self.move_back(ply, b));
         let mut picker = crate::refsearch::MoveOrder::new(tt_move, 0, true);
         picker.load(board, &legal);

@@ -251,13 +251,28 @@ fn hist_add(entry: &mut i32, bonus: i32, max: i32) {
 /// position from a slow one, which the first two cannot: both read "several
 /// moves are equally good" as difficulty, so they fire on quiet positions with
 /// many reasonable answers.
-fn time_scale(effort_frac: f64, settle: u32, score_drop: i32, changes: u32) -> f64 {
+fn time_scale(effort_frac: f64, settle: u32, score_drop: i32, changes: u32,
+              steady: Option<u32>) -> f64 {
     let effort = (1.40 - effort_frac) * 1.55;
     let settle = (0.95 + 2.2 * (settle as f64 + 2.6).powf(-1.5)).max(1.0);
-    let falling = if score_drop > 0 {
-        (1.0 + score_drop as f64 * 0.004).min(1.5)
-    } else {
-        1.0
+    // A score that has stopped moving is confidence, and confidence is time
+    // that can be spent elsewhere. The old term only ever added: it paid for a
+    // falling score and did nothing for a settled one, so a position that had
+    // been quiet for six iterations cost exactly as much as one still being
+    // argued about, and there was never anything saved to spend later.
+    //
+    // It also counts movement in BOTH directions. A score climbing fast is as
+    // much a reason to look further as one falling -- something has changed and
+    // the previous iterations were describing a different position.
+    let falling = match steady {
+        Some(k) => [1.39, 1.19, 1.01, 0.93, 0.88][k.min(4) as usize],
+        None => {
+            if score_drop > 0 {
+                (1.0 + score_drop as f64 * 0.004).min(1.5)
+            } else {
+                1.0
+            }
+        }
     };
     let instability = (1.0 + changes as f64 * 0.22).min(2.4);
     (effort * settle * falling * instability).clamp(0.65, 3.4)
@@ -356,6 +371,10 @@ pub struct Params {
     /// time today a constant has been carried across a scale boundary, and the
     /// first two both silently disabled the thing they were meant to control.
     pub probcut_margin: i32,
+    /// How far the score may move and still count as settled. Two hundred
+    /// is a pawn here, so forty is a fifth of one -- converted, not
+    /// carried across from the scale the shape came from.
+    pub tm_trend_window: i32,
     /// What a capture is credited with beyond the piece it takes, before the
     /// quiescence margin gives up on it.
     ///
@@ -422,6 +441,7 @@ impl Default for Params {
             lmr_nonpv_f: 1024,
             lmr_ttpv_f: 1024,
             probcut_margin: 294,
+            tm_trend_window: 40,
             qs_margin: 450,
             tm_mtg: 46,
             tm_inc_pct: 75,
@@ -474,6 +494,7 @@ pub const PARAM_SPECS: &[ParamSpec] = &[
     ("LmrNonPvF", |p| p.lmr_nonpv_f, |p, v| p.lmr_nonpv_f = v, 0, 2048),
     ("LmrTtPvF", |p| p.lmr_ttpv_f, |p, v| p.lmr_ttpv_f = v, 0, 2048),
     ("ProbcutMargin", |p| p.probcut_margin, |p, v| p.probcut_margin = v, 100, 1024),
+    ("TmTrendWindow", |p| p.tm_trend_window, |p, v| p.tm_trend_window = v, 5, 200),
     ("QsMargin", |p| p.qs_margin, |p, v| p.qs_margin = v, 50, 900),
     ("TmMtg", |p| p.tm_mtg, |p, v| p.tm_mtg = v, 15, 70),
     ("TmIncPct", |p| p.tm_inc_pct, |p, v| p.tm_inc_pct = v, 20, 95),
@@ -560,6 +581,11 @@ pub struct Features {
     pub qs_futility: bool,
     /// Spend less when most of the tree went to the move that won anyway.
     pub tm_node_effort: bool,
+    /// Let a settled score buy time back, instead of only paying for a
+    /// falling one. Measured in the sibling engine at +15.0 Elo over 1003
+    /// games, together with a moves-left curve that this one already has
+    /// in another form.
+    pub tm_trend: bool,
     /// Trust a stored lower bound far enough above beta without re-searching.
     pub probcut: bool,
     /// Only try the null move where the node is expected to fail high.
@@ -620,6 +646,7 @@ impl Default for Features {
             lmp_improving: false,
             qs_futility: false,
             tm_node_effort: true,
+            tm_trend: false,
             probcut: false,
             // On by default since 2026-09-01: 1015 games at 16+0.16,
             // +5.8 Elo either way of 21.
@@ -670,6 +697,7 @@ impl Features {
             "lmpimproving" => self.lmp_improving = on,
             "qsfutility" => self.qs_futility = on,
             "tmnodeeffort" => self.tm_node_effort = on,
+            "tmtrend" => self.tm_trend = on,
             "probcut" => self.probcut = on,
             "nmpcutnode" => self.nmp_cut_node = on,
             "rfpdamp" => self.rfp_damp = on,
@@ -688,7 +716,8 @@ impl Features {
     }
 
     /// The ones outside the settled set. All default off.
-    pub const EXTRA: [&'static str; 13] = [
+    pub const EXTRA: [&'static str; 14] = [
+        "TmTrend",
         "CutNodeLmr",
         "LmrCaptures",
         "Razoring",
@@ -1299,6 +1328,10 @@ impl Searcher {
         let mut best_move_changes = 0i32;
         let mut iters_since_change = 0i32;
         let mut average_score = 0i32;
+        // Consecutive iterations whose score stayed near that average.
+        // Capped: past four the position has settled and counting further
+        // says nothing more.
+        let mut eval_steady = 0u32;
         let base_soft = self.soft;
 
         for depth in 1..=max_depth {
@@ -1363,6 +1396,15 @@ impl Searcher {
             if depth == 1 {
                 average_score = score;
             } else {
+                // Against the average before it swallows this score:
+                // comparing with one that already has is an easier question and
+                // makes the window mean half what it says.
+                let ediff = (score - average_score).abs();
+                eval_steady = if ediff <= self.params.tm_trend_window {
+                    (eval_steady + 1).min(4)
+                } else {
+                    0
+                };
                 average_score = (score + 9 * average_score) / 10;
             }
             if best != last_best {
@@ -1400,7 +1442,12 @@ impl Searcher {
             } else {
                 0
             };
-            let factor = time_scale(effort_frac, settle, drop, changes);
+            let steady = if self.features.tm_trend {
+                Some(eval_steady)
+            } else {
+                None
+            };
+            let factor = time_scale(effort_frac, settle, drop, changes, steady);
 
             // The scaling moves the plan, never the wall. Whatever the position
             // says, a move cannot spend more than the clock allows.
