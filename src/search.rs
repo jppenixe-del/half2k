@@ -843,6 +843,27 @@ pub struct Searcher {
 }
 
 /// The score of a position from the side to move's point of view.
+/// Material left on the board, from White, in the units the network speaks.
+///
+/// The endgame knowledge asks who has the material before it asks anything
+/// else, and a network answers with a position rather than a count. This is the
+/// count.
+fn material_white(board: &Board) -> i32 {
+    let mut v = 0;
+    for pt in [
+        PieceType::Pawn,
+        PieceType::Knight,
+        PieceType::Bishop,
+        PieceType::Rook,
+        PieceType::Queen,
+    ] {
+        let val = value_in_eval_units(pt);
+        v += val * board.pieces[Color::White.idx()][pt.idx()].count_ones() as i32;
+        v -= val * board.pieces[Color::Black.idx()][pt.idx()].count_ones() as i32;
+    }
+    v
+}
+
 fn evaluate(board: &Board, fade: bool) -> i32 {
     let net = match nnue::net() {
         Some(n) => n,
@@ -852,7 +873,48 @@ fn evaluate(board: &Board, fade: bool) -> i32 {
         Some(a) => a,
         None => return 0,
     };
-    let raw = acc.eval(net, board.side, board.occ_all.count_ones());
+    let mut raw = acc.eval(net, board.side, board.occ_all.count_ones());
+
+    // Endgame knowledge, where counting material is simply wrong.
+    //
+    // A network trained on positions is confident about endings it has barely
+    // seen, and confidently wrong in a particular way: it scores two knights
+    // against a bare king as an advantage, when that position cannot be won at
+    // all, and it scores a rook against a bare king as an advantage of the same
+    // size, when that one is a forced mate. An engine that cannot tell those
+    // apart will trade into the draw and decline the win.
+    //
+    // Two kinds of answer, because endings need two. Some positions have a
+    // known value and the evaluation should be replaced rather than nudged --
+    // a theoretical draw is worth nothing whatever the material says, and a won
+    // ending is about progress rather than material: driving the defending king
+    // to the edge, and to the right corner. Others are right about who is
+    // better and wrong about whether it can be converted, and those are scaled.
+    if board.occ_all.count_ones() <= 7 {
+        let mat = material_white(board);
+        let q_minus_p = 0;
+        if let Some((strong, verdict)) = crate::endgame::probe(board, mat, q_minus_p) {
+            let mut v = match verdict {
+                crate::endgame::Verdict::Exact(x) => x,
+                crate::endgame::Verdict::Scale(s) => {
+                    let base = if strong == Color::White { raw } else { -raw };
+                    let base = if board.side == Color::White { base } else { -base };
+                    base * s / crate::endgame::SCALE_NORMAL
+                }
+            };
+            // The module speaks for the strong side; the search wants the side
+            // to move.
+            if strong != board.side {
+                v = -v;
+            }
+            return v;
+        }
+        // Nothing known, but a decisive material edge with the loser's king
+        // still running: give the search a reason to walk it to the edge, which
+        // is the one thing the material count cannot say.
+        let drive = crate::endgame::conversion_drive(board, mat);
+        raw += if board.side == Color::White { drive } else { -drive };
+    }
 
     // Fade towards a draw as the fifty move counter runs out. A network trained
     // on positions is confident about a position that is about to stop counting

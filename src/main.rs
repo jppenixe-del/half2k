@@ -12,6 +12,7 @@
 mod attacks;
 mod bitboard;
 mod board;
+mod endgame;
 mod magic;
 mod movegen;
 mod moves;
