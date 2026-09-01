@@ -632,7 +632,16 @@ impl Default for Features {
             capture_hist: false,
             ref_search: false,
             log_lmr: false,
-            cut_node_lmr: true,
+            // Off since 2026-09-01. Switching it OFF measured +6.5 Elo over
+            // 1021 games at 16+0.16 -- inside the noise like everything at
+            // this sample size, but the direction is that it was costing.
+            //
+            // It had been on since the search was written, on the strength
+            // of belonging in the baseline, and nobody had ever asked it for
+            // a number. That is the point of measuring removals: a technique
+            // that arrived with the first draft is no more entitled to its
+            // place than one proposed yesterday.
+            cut_node_lmr: false,
             history_prune: true,
             tm_stability: true,
             lmr_captures: true,
@@ -670,7 +679,8 @@ impl Features {
     }
 
     /// The ones outside the settled set. All default off.
-    pub const EXTRA: [&'static str; 11] = [
+    pub const EXTRA: [&'static str; 12] = [
+        "CutNodeLmr",
         "Razoring",
         "Rule50Fade",
         "TtPvLmr",
@@ -685,8 +695,8 @@ impl Features {
     ];
 
     /// The ones it does have, so they are in the baseline. All default on.
-    pub const BASELINE: [&'static str; 9] =
-        ["CutNodeLmr", "HistoryPrune", "LmrCaptures", "TmStability", "IIR", "TmNodeEffort",
+    pub const BASELINE: [&'static str; 8] =
+        ["HistoryPrune", "LmrCaptures", "TmStability", "IIR", "TmNodeEffort",
      "CorrHist", "RfpDamp", "NmpCutNode"];
 }
 
